@@ -93,9 +93,22 @@ node index.js --all --window 60 --auth-dir ./auth_info
 | `--timeout <seconds>` | `120` | global watchdog |
 | `--auth-dir <path>` | `/app/auth_info` | Baileys credentials |
 | `--topic <name>` | `general` | Telegram topic for routing intent |
+| `--list-groups` | — | list all participating groups (JID + name) as JSON and exit |
 | `--strict` | off | exit 3 when any result is PARTIAL |
 
-Exactly one of `--target` / `--jid` / `--all` is required.
+Exactly one of `--target` / `--jid` / `--all` / `--list-groups` is required.
+
+## Finding your JIDs
+
+- **DMs**: the phone number in international format + `@s.whatsapp.net`
+  (e.g. `628123xxxxxxx@s.whatsapp.net`).
+- **Groups**: the JID is not shown in the app. After QR auth, list them:
+  ```bash
+  node index.js --list-groups --auth-dir ./auth_info | jq .
+  # {"status":"OK","groups":[{"jid":"120363xxxxxxxxx@g.us","name":"DevOps Team","participants":12}]}
+  ```
+  Copy the `jid` into `targets.json`. `--list-groups` opens no history sync
+  and needs no `targets.json`.
 
 Output (single target):
 

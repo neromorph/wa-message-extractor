@@ -425,11 +425,11 @@ function closeSocket(sock) {
 }
 
 /**
- * Open one connection, collect history + live messages for the target JIDs,
- * then resolve. Rejects with { fatal, message } on unrecoverable errors.
+ * Create one Baileys socket wrapped in the read-only Proxy.
+ * The raw socket never leaves this module's connection functions.
  */
-async function connectOnce(input) {
-  const { state, saveCreds } = await useMultiFileAuthState(input.authDir);
+async function openSocket(authDir) {
+  const { state, saveCreds } = await useMultiFileAuthState(authDir);
   const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
@@ -447,6 +447,44 @@ async function connectOnce(input) {
   });
   const safe = createReadOnlySocket(sock);
   sock.ev.on("creds.update", saveCreds);
+  return { sock, safe };
+}
+
+/**
+ * Wait for the connection to open, showing the QR on stderr in
+ * interactive mode. Rejects with { code, error } on early close.
+ */
+function waitForOpen(sock, interactive) {
+  return new Promise((resolve, reject) => {
+    sock.ev.on("connection.update", (update) => {
+      const { connection, lastDisconnect, qr } = update;
+      if (qr) {
+        if (interactive) {
+          logger.info("Scan the QR code below with WhatsApp (Linked devices).");
+          qrcode.generate(qr, { small: true }, (code) => {
+            process.stderr.write(`${code}\n`);
+          });
+        } else {
+          logger.warn("QR requested but stdout is not a TTY — cannot display it.");
+        }
+      }
+      if (connection === "open") {
+        resolve();
+      }
+      if (connection === "close") {
+        const code = disconnectCode(lastDisconnect ? lastDisconnect.error : undefined);
+        reject({ code, error: lastDisconnect ? lastDisconnect.error : undefined });
+      }
+    });
+  });
+}
+
+/**
+ * Open one connection, collect history + live messages for the target JIDs,
+ * then resolve. Rejects with { fatal, message } on unrecoverable errors.
+ */
+async function connectOnce(input) {
+  const { sock, safe } = await openSocket(input.authDir);
 
   const targetJids = new Set(input.targets.map((target) => target.jid));
   const collected = [];
@@ -509,28 +547,7 @@ async function connectOnce(input) {
     }
   });
 
-  const openPromise = new Promise((resolve, reject) => {
-    sock.ev.on("connection.update", (update) => {
-      const { connection, lastDisconnect, qr } = update;
-      if (qr) {
-        if (input.interactive) {
-          logger.info("Scan the QR code below with WhatsApp (Linked devices).");
-          qrcode.generate(qr, { small: true }, (code) => {
-            process.stderr.write(`${code}\n`);
-          });
-        } else {
-          logger.warn("QR requested but stdout is not a TTY — cannot display it.");
-        }
-      }
-      if (connection === "open") {
-        resolve();
-      }
-      if (connection === "close") {
-        const code = disconnectCode(lastDisconnect ? lastDisconnect.error : undefined);
-        reject({ code, error: lastDisconnect ? lastDisconnect.error : undefined });
-      }
-    });
-  });
+  const openPromise = waitForOpen(sock, input.interactive);
 
   // connection.update "close" during the sync window must abort the wait
   let abortSync = null;
@@ -639,6 +656,40 @@ async function connectOnce(input) {
   };
 }
 
+/**
+ * Format group metadata into the --list-groups payload shape (pure).
+ */
+export function formatGroupList(all) {
+  const table = all || {};
+  return Object.values(table)
+    .filter((meta) => meta && meta.id)
+    .map((meta) => ({
+      jid: meta.id,
+      name: meta.subject || "",
+      participants: Array.isArray(meta.participants) ? meta.participants.length : 0,
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Connect, fetch all participating groups (read query), print, exit.
+ */
+async function listGroups(input) {
+  const { sock, safe } = await openSocket(input.authDir);
+  try {
+    await waitForOpen(sock, input.interactive);
+  } catch (failure) {
+    closeSocket(sock);
+    throw failure;
+  }
+  const all = await safe.groupFetchAllParticipating();
+  closeSocket(sock);
+  return formatGroupList(all);
+}
+
+const LOGGED_OUT_MESSAGE =
+  "WhatsApp session logged out (401). Delete the auth directory contents and re-run interactively to scan a fresh QR code. Credentials were NOT deleted automatically.";
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -651,6 +702,7 @@ function buildProgram() {
     .option("--target <alias>", "process a single target by alias from targets.json")
     .option("--jid <jid>", "process a single direct JID")
     .option("--all", "process all enabled targets from targets.json")
+    .option("--list-groups", "list all participating groups as JSON and exit")
     .option("--window <minutes>", "time window in minutes", String(DEFAULT_WINDOW_MINUTES))
     .option("--wait <seconds>", "max seconds to wait for history sync", String(DEFAULT_WAIT_SECS))
     .option(
@@ -683,16 +735,19 @@ async function main(argv) {
     return;
   }
 
-  const selectors = [opts.target, opts.jid, opts.all ? "all" : undefined].filter(
-    (value) => value !== undefined,
-  );
+  const selectors = [
+    opts.target,
+    opts.jid,
+    opts.all ? "all" : undefined,
+    opts.listGroups ? "list" : undefined,
+  ].filter((value) => value !== undefined);
   if (selectors.length === 0) {
     program.help();
     return;
   }
   if (selectors.length > 1) {
     writeStdoutJson(
-      errorPayload("Pass exactly one of --target, --jid, or --all.", base),
+      errorPayload("Pass exactly one of --target, --jid, --all, or --list-groups.", base),
       EXIT_ERROR,
     );
     return;
@@ -773,6 +828,38 @@ async function main(argv) {
     return;
   }
 
+  // Group discovery needs no targets.json and no history wait.
+  if (opts.listGroups) {
+    let groups;
+    try {
+      groups = await listGroups({ authDir: opts.authDir, interactive });
+    } catch (failure) {
+      const code = failure && typeof failure.code === "number" ? failure.code : undefined;
+      if (code === DisconnectReason.loggedOut) {
+        writeStdoutJson(errorPayload(LOGGED_OUT_MESSAGE, base), EXIT_ERROR);
+      } else {
+        const detail = failure && failure.error ? String(failure.error) : `disconnect code ${code}`;
+        writeStdoutJson(errorPayload(`Group listing failed: ${detail}`, base), EXIT_ERROR);
+      }
+      return;
+    }
+    const extractedAt = new Date().toISOString();
+    logger.info({ total: groups.length }, "group listing complete");
+    writeStdoutJson(
+      {
+        status: "OK",
+        meta: {
+          destination_telegram_topic: topic,
+          extracted_at: extractedAt,
+          total_groups: groups.length,
+        },
+        groups,
+      },
+      EXIT_OK,
+    );
+    return;
+  }
+
   let attempt = 0;
   let collected = null;
   while (attempt <= MAX_RECONNECTS) {
@@ -790,7 +877,7 @@ async function main(argv) {
       if (code === DisconnectReason.loggedOut) {
         writeStdoutJson(
           errorPayload(
-            "WhatsApp session logged out (401). Delete the auth directory contents and re-run interactively to scan a fresh QR code. Credentials were NOT deleted automatically.",
+            LOGGED_OUT_MESSAGE,
             base,
           ),
           EXIT_ERROR,

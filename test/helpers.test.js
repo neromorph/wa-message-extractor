@@ -10,6 +10,7 @@ import {
   createReadOnlySocket,
   extractMessageText,
   filterByWindow,
+  formatGroupList,
   loadTargetsFile,
   messageTimestampMs,
   normalizeMessage,
@@ -289,6 +290,24 @@ describe("buildEnvelope", () => {
     assert.equal(envelope.meta.target_count, 2);
     assert.equal(envelope.meta.total_messages, 1);
     assert.equal(envelope.results.length, 2);
+  });
+});
+
+describe("formatGroupList", () => {
+  it("maps metadata to JID list sorted by name", () => {
+    const groups = formatGroupList({
+      "222@g.us": { id: "222@g.us", subject: "Zulu", participants: [{}, {}] },
+      "111@g.us": { id: "111@g.us", subject: "Alpha" },
+      broken: null,
+    });
+    assert.deepEqual(groups, [
+      { jid: "111@g.us", name: "Alpha", participants: 0 },
+      { jid: "222@g.us", name: "Zulu", participants: 2 },
+    ]);
+  });
+
+  it("tolerates missing input", () => {
+    assert.deepEqual(formatGroupList(undefined), []);
   });
 });
 
