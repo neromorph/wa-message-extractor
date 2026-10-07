@@ -15,6 +15,7 @@ RUN npm ci --omit=dev --omit=peer --omit=optional --ignore-scripts
 # Remaining application files
 COPY index.js ./
 COPY targets.json ./
+COPY tools/deny-list.js ./tools/deny-list.js
 
 # Pre-seed auth dir owned by nonroot (UID 65532) so the named volume
 # inherits correct ownership on first mount via Docker copy-up.
@@ -28,6 +29,7 @@ WORKDIR /app
 COPY --from=builder --chown=65532:65532 /app/node_modules ./node_modules
 COPY --from=builder --chown=65532:65532 /app/index.js ./index.js
 COPY --from=builder --chown=65532:65532 /app/targets.json ./targets.json
+COPY --from=builder --chown=65532:65532 /app/tools/deny-list.js ./tools/deny-list.js
 COPY --from=builder --chown=65532:65532 /app/auth_info ./auth_info
 
 USER nonroot:nonroot

@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 
 import {
-  MUTATING_METHODS,
   buildEnvelope,
   buildTargetResult,
   createReadOnlySocket,
@@ -17,6 +16,7 @@ import {
   resolveSenderName,
   senderJidOf,
 } from "../index.js";
+import { MUTATING_METHODS } from "../tools/deny-list.js";
 
 const nowMs = Date.now();
 const minutesAgo = (minutes) => Math.floor((nowMs - minutes * 60 * 1000) / 1000);

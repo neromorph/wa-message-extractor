@@ -8,46 +8,9 @@
 // string literals inside arrays.
 import { defineRule } from "@oxlint/plugins";
 
-const MUTATING_METHODS = new Set([
-  "sendMessage",
-  "sendReceipt",
-  "sendReceipts",
-  "readMessages",
-  "chatModify",
-  "sendPresenceUpdate",
-  "presenceSubscribe",
-  "updateProfileStatus",
-  "updateProfileName",
-  "updateProfilePicture",
-  "removeProfilePicture",
-  "fetchPrivacySettings",
-  "updateBlockStatus",
-  "updateLastSeenPrivacy",
-  "updateOnlinePrivacy",
-  "updateReadReceiptsPrivacy",
-  "updateGroupsAddPrivacy",
-  "updateDefaultDisappearingMode",
-  "groupCreate",
-  "groupLeave",
-  "groupUpdateSubject",
-  "groupUpdateDescription",
-  "groupParticipantsUpdate",
-  "groupSettingUpdate",
-  "groupInviteCode",
-  "groupRevokeInvite",
-  "groupAcceptInvite",
-  "groupGetInviteInfo",
-  "newsletterCreate",
-  "newsletterUpdate",
-  "newsletterDelete",
-  "newsletterReact",
-  "newsletterFollow",
-  "newsletterUnfollow",
-  "newsletterMute",
-  "newsletterUnmute",
-  "logout",
-  "requestPairingCode",
-]);
+import { MUTATING_METHODS } from "../../deny-list.js";
+
+const MUTATING_SET = new Set(MUTATING_METHODS);
 
 export const noWhatsappMutationRule = defineRule({
   meta: {
@@ -75,7 +38,7 @@ export const noWhatsappMutationRule = defineRule({
         if (prop.type !== "Identifier") {
           return;
         }
-        if (MUTATING_METHODS.has(prop.name)) {
+        if (MUTATING_SET.has(prop.name)) {
           context.report({
             node,
             messageId: "mutation",

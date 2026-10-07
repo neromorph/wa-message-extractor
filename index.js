@@ -32,6 +32,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import pino from "pino";
 import qrcode from "qrcode-terminal";
+import { MUTATING_METHODS } from "./tools/deny-list.js";
 
 const TELEGRAM_TOPIC = "Merkle";
 const SETTLE_MS = 3000;
@@ -44,48 +45,6 @@ const EXIT_OK = 0;
 const EXIT_ERROR = 1;
 const EXIT_NEEDS_AUTH = 2;
 const EXIT_PARTIAL_STRICT = 3;
-
-// Keep in sync with tools/oxlint/wa-readonly/index.ts (MUTATING_METHODS).
-export const MUTATING_METHODS = [
-  "sendMessage",
-  "sendReceipt",
-  "sendReceipts",
-  "readMessages",
-  "chatModify",
-  "sendPresenceUpdate",
-  "presenceSubscribe",
-  "updateProfileStatus",
-  "updateProfileName",
-  "updateProfilePicture",
-  "removeProfilePicture",
-  "fetchPrivacySettings",
-  "updateBlockStatus",
-  "updateLastSeenPrivacy",
-  "updateOnlinePrivacy",
-  "updateReadReceiptsPrivacy",
-  "updateGroupsAddPrivacy",
-  "updateDefaultDisappearingMode",
-  "groupCreate",
-  "groupLeave",
-  "groupUpdateSubject",
-  "groupUpdateDescription",
-  "groupParticipantsUpdate",
-  "groupSettingUpdate",
-  "groupInviteCode",
-  "groupRevokeInvite",
-  "groupAcceptInvite",
-  "groupGetInviteInfo",
-  "newsletterCreate",
-  "newsletterUpdate",
-  "newsletterDelete",
-  "newsletterReact",
-  "newsletterFollow",
-  "newsletterUnfollow",
-  "newsletterMute",
-  "newsletterUnmute",
-  "logout",
-  "requestPairingCode",
-];
 
 const logger = pino(
   { level: process.env.LOG_LEVEL || "info" },
@@ -162,7 +121,34 @@ function unwrapMessage(message) {
 /**
  * Extract display text and a coarse type from a WAMessage.
  * Media is never downloaded — captions only, otherwise text is null.
+ *
+ * Each row: [message key, text source, message_type]. The source is a field
+ * name, null (never has text), or a picker function. First match wins, so
+ * row order is the precedence order.
  */
+const MESSAGE_TEXT_FIELDS = [
+  ["extendedTextMessage", "text", "text"],
+  ["imageMessage", "caption", "image"],
+  ["videoMessage", "caption", "video"],
+  ["documentMessage", "caption", "document"],
+  ["audioMessage", null, "audio"],
+  ["stickerMessage", null, "sticker"],
+  ["reactionMessage", "text", "reaction"],
+  ["pollCreationMessage", "name", "poll"],
+  ["pollCreationMessageV2", "name", "poll"],
+  ["pollCreationMessageV3", "name", "poll"],
+  [
+    "buttonsResponseMessage",
+    (part) => part.selectedDisplayText || part.selectedButtonId || null,
+    "buttons_response",
+  ],
+  ["listResponseMessage", "title", "list_response"],
+  ["templateButtonReplyMessage", "selectedId", "template_reply"],
+  ["locationMessage", null, "location"],
+  ["liveLocationMessage", null, "live_location"],
+  ["contactMessage", null, "contact"],
+];
+
 export function extractMessageText(wam) {
   const message = unwrapMessage(wam.message);
   if (message === null || message === undefined) {
@@ -171,59 +157,15 @@ export function extractMessageText(wam) {
   if (message.conversation) {
     return { text: message.conversation, message_type: "text" };
   }
-  const ext = message.extendedTextMessage;
-  if (ext && ext.text) {
-    return { text: ext.text, message_type: "text" };
-  }
-  const image = message.imageMessage;
-  if (image) {
-    return { text: image.caption || null, message_type: "image" };
-  }
-  const video = message.videoMessage;
-  if (video) {
-    return { text: video.caption || null, message_type: "video" };
-  }
-  const doc = message.documentMessage;
-  if (doc) {
-    return { text: doc.caption || null, message_type: "document" };
-  }
-  if (message.audioMessage) {
-    return { text: null, message_type: "audio" };
-  }
-  if (message.stickerMessage) {
-    return { text: null, message_type: "sticker" };
-  }
-  const reaction = message.reactionMessage;
-  if (reaction) {
-    return { text: reaction.text || null, message_type: "reaction" };
-  }
-  const poll = message.pollCreationMessage || message.pollCreationMessageV2 || message.pollCreationMessageV3;
-  if (poll) {
-    return { text: poll.name || null, message_type: "poll" };
-  }
-  const buttons = message.buttonsResponseMessage;
-  if (buttons) {
-    return {
-      text: buttons.selectedDisplayText || buttons.selectedButtonId || null,
-      message_type: "buttons_response",
-    };
-  }
-  const list = message.listResponseMessage;
-  if (list) {
-    return { text: list.title || null, message_type: "list_response" };
-  }
-  const template = message.templateButtonReplyMessage;
-  if (template) {
-    return { text: template.selectedId || null, message_type: "template_reply" };
-  }
-  if (message.locationMessage) {
-    return { text: null, message_type: "location" };
-  }
-  if (message.liveLocationMessage) {
-    return { text: null, message_type: "live_location" };
-  }
-  if (message.contactMessage) {
-    return { text: null, message_type: "contact" };
+  for (const [key, source, type] of MESSAGE_TEXT_FIELDS) {
+    const part = message[key];
+    if (!part) {
+      continue;
+    }
+    if (typeof source === "function") {
+      return { text: source(part), message_type: type };
+    }
+    return { text: source ? part[source] || null : null, message_type: type };
   }
   const keys = Object.keys(message);
   const firstKey = keys.length > 0 ? keys[0] : "unknown";
@@ -346,9 +288,6 @@ export function buildEnvelope(inputs) {
   if (partials > 0) {
     status = "PARTIAL";
   }
-  if (results.length > 0 && partials === results.length) {
-    status = "PARTIAL";
-  }
   return {
     status,
     meta: {
@@ -367,12 +306,8 @@ export function buildEnvelope(inputs) {
 // Config loading (lazy — --jid works without targets.json)
 // ---------------------------------------------------------------------------
 
-function targetsPath() {
-  return fileURLToPath(new URL("./targets.json", import.meta.url));
-}
-
 export function loadTargetsFile(customPath) {
-  const path = customPath || targetsPath();
+  const path = customPath || fileURLToPath(new URL("./targets.json", import.meta.url));
   let stat;
   try {
     stat = statSync(path);
@@ -437,17 +372,17 @@ function writeStdoutJson(payload, exitCode) {
   });
 }
 
+const EXIT_FOR_STATUS = {
+  OK: EXIT_OK,
+  NEEDS_AUTH: EXIT_NEEDS_AUTH,
+  ERROR: EXIT_ERROR,
+};
+
 function exitCodeForStatus(status, strict) {
-  if (status === "OK") {
-    return EXIT_OK;
-  }
   if (status === "PARTIAL") {
     return strict ? EXIT_PARTIAL_STRICT : EXIT_OK;
   }
-  if (status === "NEEDS_AUTH") {
-    return EXIT_NEEDS_AUTH;
-  }
-  return EXIT_ERROR;
+  return EXIT_FOR_STATUS[status] ?? EXIT_ERROR;
 }
 
 function errorPayload(message, base) {
@@ -467,13 +402,7 @@ function errorPayload(message, base) {
 // ---------------------------------------------------------------------------
 
 function syncTypeName(value) {
-  const table = proto.HistorySync.HistorySyncType;
-  for (const name of Object.keys(table)) {
-    if (table[name] === value) {
-      return name;
-    }
-  }
-  return String(value);
+  return proto.HistorySync.HistorySyncType[value] ?? String(value);
 }
 
 function disconnectCode(error) {
@@ -484,20 +413,11 @@ function disconnectCode(error) {
 }
 
 function closeSocket(sock) {
+  // sock.end exists in the pinned Baileys; failures mean already closing.
   try {
-    if (typeof sock.end === "function") {
-      const done = sock.end(undefined);
-      if (done && typeof done.catch === "function") {
-        done.catch(() => {});
-      }
-      return;
-    }
-  } catch {
-    // fall through to ws close
-  }
-  try {
-    if (sock.ws && typeof sock.ws.close === "function") {
-      sock.ws.close();
+    const done = sock.end(undefined);
+    if (done && typeof done.catch === "function") {
+      done.catch(() => {});
     }
   } catch {
     // already closing — nothing to do
@@ -543,8 +463,7 @@ async function connectOnce(input) {
     return Boolean(remote && targetJids.has(remote));
   };
 
-  sock.ev.on("messaging-history.set", ({ chats, contacts: fresh, messages, syncType }) => {
-    void chats;
+  sock.ev.on("messaging-history.set", ({ contacts: fresh, messages, syncType }) => {
     if (Array.isArray(fresh)) {
       for (const contact of fresh) {
         if (contact && contact.id) {
@@ -696,9 +615,7 @@ async function connectOnce(input) {
       }, SETTLE_MS);
     };
     notifyChunk = armQuiet;
-    notifyStatus = () => {
-      armQuiet();
-    };
+    notifyStatus = armQuiet;
     // Seed the quiet timer in case history already arrived before open.
     if (chunks > 0) {
       armQuiet();
@@ -720,10 +637,6 @@ async function connectOnce(input) {
       stopped_by: syncResult.stoppedBy,
     },
   };
-}
-
-function describeTargets(targets) {
-  return targets.map((target) => target.alias).join(", ");
 }
 
 // ---------------------------------------------------------------------------
@@ -945,7 +858,10 @@ async function main(argv) {
       historySync: collected.historySync,
     });
     logger.info(
-      { targets: describeTargets(targets), total: envelope.meta.total_messages },
+      {
+        targets: targets.map((target) => target.alias).join(", "),
+        total: envelope.meta.total_messages,
+      },
       "extraction complete",
     );
     writeStdoutJson(envelope, exitCodeForStatus(envelope.status, opts.strict));

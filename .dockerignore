@@ -10,7 +10,8 @@ README.md
 .husky
 .opencode
 test
-tools
+tools/oxlint/
+tools/security-scan.sh
 .github
 .vscode
 .idea

@@ -18,7 +18,6 @@
     "lint:fix": "oxlint --config .oxlintrc.jsonc --fix",
     "verify": "npm run lint && npm test",
     "security": "./tools/security-scan.sh",
-    "setup:hooks": "npx husky",
     "prepare": "husky"
   },
   "dependencies": {
