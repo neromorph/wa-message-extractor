@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
+import { DisconnectReason } from "@whiskeysockets/baileys";
 
 import {
   buildEnvelope,
@@ -295,8 +296,7 @@ describe("buildEnvelope", () => {
 });
 
 describe("isRetryable", () => {
-  it("retries transient closes but not logout", async () => {
-    const { DisconnectReason } = await import("@whiskeysockets/baileys");
+  it("retries transient closes but not logout", () => {
     assert.equal(isRetryable(DisconnectReason.restartRequired), true);
     assert.equal(isRetryable(DisconnectReason.connectionLost), true);
     assert.equal(isRetryable(DisconnectReason.loggedOut), false);

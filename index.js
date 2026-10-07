@@ -701,27 +701,25 @@ async function listGroups(input) {
  * No history sync, no queries. Retries the post-pairing restart (515).
  */
 async function authOnly(input) {
-  const maxAttempts = input.maxAttempts || MAX_RECONNECTS + 1;
   let attempt = 0;
   for (;;) {
     const { sock } = await openSocket(input.authDir);
     try {
       await waitForOpen(sock, input.interactive);
-      closeSocket(sock);
       return;
     } catch (failure) {
-      closeSocket(sock);
       const code = failure && typeof failure.code === "number" ? failure.code : undefined;
-      if (isRetryable(code) && attempt + 1 < maxAttempts) {
-        const backoff = 2000 * 2 ** attempt;
-        logger.warn({ code, attempt: attempt + 1, backoffMs: backoff }, "auth retrying");
-        await new Promise((resolve) => {
-          setTimeout(resolve, backoff);
-        });
-        attempt += 1;
-        continue;
+      if (!isRetryable(code) || attempt >= MAX_RECONNECTS) {
+        throw failure;
       }
-      throw failure;
+      const backoff = 2000 * 2 ** attempt;
+      logger.warn({ code, attempt: attempt + 1, backoffMs: backoff }, "auth retrying");
+      await new Promise((resolve) => {
+        setTimeout(resolve, backoff);
+      });
+      attempt += 1;
+    } finally {
+      closeSocket(sock);
     }
   }
 }
@@ -954,8 +952,7 @@ async function main(argv) {
         );
         return;
       }
-      const retryable = isRetryable(code);
-      if (retryable && attempt < MAX_RECONNECTS) {
+      if (isRetryable(code) && attempt < MAX_RECONNECTS) {
         const backoff = 2000 * 2 ** attempt;
         logger.warn({ code, attempt: attempt + 1, backoffMs: backoff }, "connection dropped, retrying");
         await new Promise((resolve) => {
