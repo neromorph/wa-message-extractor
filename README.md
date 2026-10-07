@@ -184,7 +184,9 @@ socket.) Full wiring, as deployed: vault note `Hermes Wiring Wa-Hourly`.
   `/home/mufid/wa-message-extractor/out:/opt/data/wa-out:ro`.
 - Gate `wa-gate.py` (in Hermes `$HERMES_HOME/scripts`): exit `1`/`2` →
   alert with 6h cooldown, `0` + zero messages → silent, `0` + messages →
-  wake with counts. Job: LLM-driven, `--continuity`, failures to a
+  wake with counts. State file is best-effort (never crash the gate);
+  install and test only as the `hermes` user — root-created files break
+  the next real tick (vault: incident 2026-10-07). Job: LLM-driven, `--continuity`, failures to a
   separate DM via `--failure-deliver`.
 - `targets.json` is the group registry — re-read every run, no restart.
 
