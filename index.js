@@ -461,14 +461,41 @@ export function quarantineCreds(authDir) {
   return backup;
 }
 
+export function isReadableJson(path) {
+  try {
+    JSON.parse(readFileSync(path, "utf8"));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Open one session. Normalizes the poisoned-creds deadlock: a 401 on
  * creds that never completed a login quarantines once per run, then
  * continues (fresh QR if interactive, POISONED error if not).
- * Returns { sock, safe }. Everything else passes through untouched.
+ * Unreadable creds.json (e.g. truncated by an early exit) counts as
+ * poisoned without needing a round-trip. Returns { sock, safe, saveCreds }.
+ * Everything else passes through untouched.
  */
 export async function openSession(input) {
-  const { sock, safe } = await openSocket(input.authDir);
+  const credsPath = join(input.authDir, "creds.json");
+  // Unreadable creds (e.g. truncated by an early exit) can never log in.
+  // Quarantine preserves the bytes for forensics either way.
+  if (!quarantineUsed && existsSync(credsPath) && !isReadableJson(credsPath)) {
+    quarantineUsed = true;
+    const backup = quarantineCreds(input.authDir);
+    logger.warn({ backup }, "quarantined unreadable credentials");
+    if (!input.interactive) {
+      const poisoned = new Error(
+        `Poisoned session quarantined to ${backup}. Re-pair interactively.`,
+      );
+      poisoned.code = POISONED_CODE;
+      poisoned.backup = backup;
+      throw poisoned;
+    }
+  }
+  const { sock, safe, saveCreds } = await openSocket(input.authDir);
   try {
     await waitForOpen(sock, input.interactive);
   } catch (failure) {
@@ -498,7 +525,7 @@ export async function openSession(input) {
   if (!isPaired(input.authDir)) {
     markPaired(input.authDir);
   }
-  return { sock, safe };
+  return { sock, safe, saveCreds };
 }
 
 /**
@@ -528,7 +555,24 @@ async function openSocket(authDir) {
       logger.fatal({ authDir, error: String(error) }, "failed to save credentials");
     });
   });
-  return { sock, safe };
+  return { sock, safe, saveCreds };
+}
+
+/**
+ * Flush pending credential writes before process exit. Baileys persists
+ * asynchronously; exiting first truncates creds.json to 0 bytes, which
+ * the next run cannot parse (fresh QR loop). Await one final save, then
+ * settle so in-flight writes land.
+ */
+export async function flushCreds(saveCreds, settleMs = 500) {
+  try {
+    await saveCreds();
+  } catch (error) {
+    logger.warn({ error: String(error) }, "final credential flush failed");
+  }
+  await new Promise((resolve) => {
+    setTimeout(resolve, settleMs);
+  });
 }
 
 /**
@@ -565,7 +609,7 @@ function waitForOpen(sock, interactive) {
  * then resolve. Rejects with { fatal, message } on unrecoverable errors.
  */
 async function connectOnce(input) {
-  const { sock, safe } = await openSession(input);
+  const { sock, safe, saveCreds } = await openSession(input);
 
   const targetJids = new Set(input.targets.map((target) => target.jid));
   const collected = [];
@@ -712,6 +756,7 @@ async function connectOnce(input) {
   });
 
   closeSocket(sock);
+  await flushCreds(saveCreds);
 
   return {
     collected,
@@ -747,9 +792,10 @@ export function formatGroupList(all) {
  * Connect, fetch all participating groups (read query), print, exit.
  */
 async function listGroups(input) {
-  const { sock, safe } = await openSession(input);
+  const { sock, safe, saveCreds } = await openSession(input);
   const all = await safe.groupFetchAllParticipating();
   closeSocket(sock);
+  await flushCreds(saveCreds);
   return formatGroupList(all);
 }
 
@@ -761,8 +807,9 @@ async function authOnly(input) {
   let attempt = 0;
   for (;;) {
     try {
-      const { sock } = await openSession(input);
+      const { sock, saveCreds } = await openSession(input);
       closeSocket(sock);
+      await flushCreds(saveCreds);
       return;
     } catch (failure) {
       const code = failureCode(failure);

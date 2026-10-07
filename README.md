@@ -252,6 +252,7 @@ docker compose config --format json | jq -e '.services.extractor.read_only == tr
 |---|---|
 | `NEEDS_AUTH` (exit 2) | no `creds.json` and no TTY → run once with a TTY to scan QR |
 | `Poisoned session quarantined …` (exit 1) | 401 on creds that never logged in → backup named in message, re-pair with `--auth` |
+| `creds.json` is 0 bytes | killed mid-write by an early exit (fixed: flush before exit) → auto-quarantined next run, re-pair |
 | `logged out (401)` | session revoked → delete auth dir contents, rescan (never automatic) |
 | `EISDIR` on targets.json | host file missing so Docker made a dir → create `./targets.json` |
 | `PARTIAL` / `stopped_by: "cap"` | slow sync → raise `--wait`, check phone connectivity |

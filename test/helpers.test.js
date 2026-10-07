@@ -11,8 +11,10 @@ import {
   createReadOnlySocket,
   extractMessageText,
   filterByWindow,
+  flushCreds,
   formatGroupList,
   isPaired,
+  isReadableJson,
   isRetryable,
   loadTargetsFile,
   markPaired,
@@ -313,6 +315,38 @@ describe("session marker", () => {
     assert.equal(isPaired(dir), false);
     markPaired(dir);
     assert.equal(isPaired(dir), true);
+  });
+});
+
+describe("isReadableJson", () => {
+  it("rejects empty and broken files", () => {
+    const dir = mkdtempSync(join(tmpdir(), "wa-session-"));
+    const empty = join(dir, "empty.json");
+    writeFileSync(empty, "");
+    assert.equal(isReadableJson(empty), false);
+    const broken = join(dir, "broken.json");
+    writeFileSync(broken, "{nope");
+    assert.equal(isReadableJson(broken), false);
+    const good = join(dir, "good.json");
+    writeFileSync(good, "{}");
+    assert.equal(isReadableJson(good), true);
+    assert.equal(isReadableJson(join(dir, "missing.json")), false);
+  });
+});
+
+describe("flushCreds", () => {
+  it("awaits one final save before settling", async () => {
+    let calls = 0;
+    await flushCreds(async () => {
+      calls += 1;
+    }, 5);
+    assert.equal(calls, 1);
+  });
+
+  it("survives a failing save", async () => {
+    await flushCreds(async () => {
+      throw new Error("disk gone");
+    }, 5);
   });
 });
 
