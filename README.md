@@ -176,8 +176,9 @@ inside Hermes cannot run containers — the Hermes image ships no Docker
 socket.) Full wiring, as deployed: vault note `Hermes Wiring Wa-Hourly`.
 
 ```cron
-# host crontab — extractor hourly, exit code captured for the gate
-5 * * * * flock -n /tmp/wa-extract.lock sh -c 'cd /home/mufid/wa-message-extractor && docker compose run --rm extractor --all --window 60 --topic Merkle > out/latest.json 2> out/last-stderr.log; echo $? > out/last-exit'
+# host crontab — daytime only (07:05–21:05 WIB); exit code captured for the gate
+5 0 * * *    flock -n /tmp/wa-extract.lock sh -c 'cd /home/mufid/wa-message-extractor && docker compose run --rm extractor --all --window 660 --topic Merkle > out/latest.json 2> out/last-stderr.log; echo $? > out/last-exit'
+5 1-14 * * * flock -n /tmp/wa-extract.lock sh -c 'cd /home/mufid/wa-message-extractor && docker compose run --rm extractor --all --window 60 --topic Merkle > out/latest.json 2> out/last-stderr.log; echo $? > out/last-exit'
 ```
 
 - Share one read-only bind with Hermes:
@@ -186,9 +187,15 @@ socket.) Full wiring, as deployed: vault note `Hermes Wiring Wa-Hourly`.
   alert with 6h cooldown, `0` + zero messages → silent, `0` + messages →
   wake with counts. State file is best-effort (never crash the gate);
   install and test only as the `hermes` user — root-created files break
-  the next real tick (vault: incident 2026-10-07). Job: LLM-driven, `--continuity`, failures to a
+  the next real tick (vault: incident 2026-10-07). Job `wa-merkle`:
+  LLM-driven, `--continuity`, schedule `10 0-14 * * *` UTC (digest lands
+  `:10`, five minutes after extraction finishes), failures to a
   separate DM via `--failure-deliver`.
 - `targets.json` is the group registry — re-read every run, no restart.
+  13 targets → Merkle (12 work groups + `self`). First run of the day
+  uses `--window 660` as an overnight catch-up; caveat: warm-session probe
+  returned `stopped_by: cap` + 0 messages, so the catch-up only proves
+  itself on a real cold morning run — verdict pending.
 
 ## Quality gates
 
