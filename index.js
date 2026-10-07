@@ -34,7 +34,7 @@ import pino from "pino";
 import qrcode from "qrcode-terminal";
 import { MUTATING_METHODS } from "./tools/deny-list.js";
 
-const TELEGRAM_TOPIC = "Merkle";
+const DEFAULT_TOPIC = "general";
 const SETTLE_MS = 3000;
 const DEFAULT_WINDOW_MINUTES = 60;
 const DEFAULT_WAIT_SECS = 30;
@@ -264,7 +264,7 @@ export function buildTargetResult(input) {
     status: partial ? "PARTIAL" : "OK",
     meta: {
       target_alias: input.target.alias,
-      destination_telegram_topic: TELEGRAM_TOPIC,
+      destination_telegram_topic: input.topic || DEFAULT_TOPIC,
       time_window_minutes: input.windowMinutes,
       extracted_at: input.extractedAt,
       total_messages: total,
@@ -291,7 +291,7 @@ export function buildEnvelope(inputs) {
   return {
     status,
     meta: {
-      destination_telegram_topic: TELEGRAM_TOPIC,
+      destination_telegram_topic: inputs.topic || DEFAULT_TOPIC,
       time_window_minutes: inputs.windowMinutes,
       extracted_at: inputs.extractedAt,
       target_count: results.length,
@@ -389,7 +389,7 @@ function errorPayload(message, base) {
   const payload = { status: "ERROR", message };
   if (base) {
     payload.meta = {
-      destination_telegram_topic: TELEGRAM_TOPIC,
+      destination_telegram_topic: base.topic || DEFAULT_TOPIC,
       time_window_minutes: base.windowMinutes,
       extracted_at: new Date().toISOString(),
     };
@@ -659,6 +659,7 @@ function buildProgram() {
       String(DEFAULT_GLOBAL_TIMEOUT_SECS),
     )
     .option("--auth-dir <path>", "directory for Baileys auth tokens", "/app/auth_info")
+    .option("--topic <name>", "Telegram topic for routing intent", DEFAULT_TOPIC)
     .option("--strict", "exit 3 when any result is PARTIAL", false);
   return program;
 }
@@ -671,6 +672,8 @@ async function main(argv) {
   const windowMinutes = Number(opts.window);
   const waitSecs = Number(opts.wait);
   const timeoutSecs = Number(opts.timeout);
+  const topic = opts.topic && opts.topic.trim() ? opts.topic.trim() : DEFAULT_TOPIC;
+  const base = { windowMinutes, topic };
   if (!Number.isFinite(windowMinutes) || windowMinutes <= 0) {
     writeStdoutJson(errorPayload("--window must be a positive number of minutes."), EXIT_ERROR);
     return;
@@ -689,7 +692,7 @@ async function main(argv) {
   }
   if (selectors.length > 1) {
     writeStdoutJson(
-      errorPayload("Pass exactly one of --target, --jid, or --all.", { windowMinutes }),
+      errorPayload("Pass exactly one of --target, --jid, or --all.", base),
       EXIT_ERROR,
     );
     return;
@@ -697,14 +700,14 @@ async function main(argv) {
 
   armWatchdog(timeoutSecs > 0 ? timeoutSecs : DEFAULT_GLOBAL_TIMEOUT_SECS, () => {
     writeStdoutJson(
-      errorPayload("Global timeout reached before extraction completed.", { windowMinutes }),
+      errorPayload("Global timeout reached before extraction completed.", base),
       EXIT_ERROR,
     );
   });
 
   const onSignal = (signal) => {
     logger.warn({ signal }, "interrupted");
-    writeStdoutJson(errorPayload(`Interrupted by ${signal}.`, { windowMinutes }), EXIT_ERROR);
+    writeStdoutJson(errorPayload(`Interrupted by ${signal}.`, base), EXIT_ERROR);
   };
   process.once("SIGINT", () => onSignal("SIGINT"));
   process.once("SIGTERM", () => onSignal("SIGTERM"));
@@ -720,18 +723,14 @@ async function main(argv) {
         const found = list.find((entry) => entry.alias === opts.target);
         if (!found) {
           writeStdoutJson(
-            errorPayload(`Target alias "${opts.target}" not found in targets.json.`, {
-              windowMinutes,
-            }),
+            errorPayload(`Target alias "${opts.target}" not found in targets.json.`, base),
             EXIT_ERROR,
           );
           return;
         }
         if (found.enabled === false) {
           writeStdoutJson(
-            errorPayload(`Target alias "${opts.target}" is disabled in targets.json.`, {
-              windowMinutes,
-            }),
+            errorPayload(`Target alias "${opts.target}" is disabled in targets.json.`, base),
             EXIT_ERROR,
           );
           return;
@@ -741,7 +740,7 @@ async function main(argv) {
         targets = list.filter((entry) => entry.enabled !== false);
         if (targets.length === 0) {
           writeStdoutJson(
-            errorPayload("No enabled targets in targets.json.", { windowMinutes }),
+            errorPayload("No enabled targets in targets.json.", base),
             EXIT_ERROR,
           );
           return;
@@ -749,16 +748,14 @@ async function main(argv) {
       }
     }
   } catch (error) {
-    writeStdoutJson(errorPayload(String(error.message || error), { windowMinutes }), EXIT_ERROR);
+    writeStdoutJson(errorPayload(String(error.message || error), base), EXIT_ERROR);
     return;
   }
 
   for (const target of targets) {
     if (!target.jid || (!target.jid.endsWith("@g.us") && !target.jid.endsWith("@s.whatsapp.net") && !target.jid.endsWith("@lid"))) {
       writeStdoutJson(
-        errorPayload(`Target "${target.alias}" has an invalid JID: ${target.jid}`, {
-          windowMinutes,
-        }),
+        errorPayload(`Target "${target.alias}" has an invalid JID: ${target.jid}`, base),
         EXIT_ERROR,
       );
       return;
@@ -794,7 +791,7 @@ async function main(argv) {
         writeStdoutJson(
           errorPayload(
             "WhatsApp session logged out (401). Delete the auth directory contents and re-run interactively to scan a fresh QR code. Credentials were NOT deleted automatically.",
-            { windowMinutes },
+            base,
           ),
           EXIT_ERROR,
         );
@@ -816,7 +813,7 @@ async function main(argv) {
       }
       const detail = failure && failure.error ? String(failure.error) : `disconnect code ${code}`;
       writeStdoutJson(
-        errorPayload(`WhatsApp connection failed: ${detail}`, { windowMinutes }),
+        errorPayload(`WhatsApp connection failed: ${detail}`, base),
         EXIT_ERROR,
       );
       return;
@@ -824,7 +821,7 @@ async function main(argv) {
   }
   if (!collected) {
     writeStdoutJson(
-      errorPayload("WhatsApp connection failed after retries.", { windowMinutes }),
+      errorPayload("WhatsApp connection failed after retries.", base),
       EXIT_ERROR,
     );
     return;
@@ -846,6 +843,7 @@ async function main(argv) {
       messages,
       windowMinutes,
       extractedAt,
+      topic,
       historySync: collected.historySync,
     });
   });
@@ -855,6 +853,7 @@ async function main(argv) {
       results,
       windowMinutes,
       extractedAt,
+      topic,
       historySync: collected.historySync,
     });
     logger.info(

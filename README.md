@@ -3,7 +3,7 @@
 Secure, production-ready, **read-only** WhatsApp message extractor CLI.
 Authenticates via Baileys, fetches history inside a time window, prints JSON
 to stdout, exits. Packaged as a rootless distroless image for VPS cron runs.
-Extracted messages are routed to the Telegram topic **Merkle** (via Hermes).
+Extracted messages are routed to a Telegram topic (via Hermes).
 
 ## How it works
 
@@ -57,8 +57,8 @@ Edit `targets.json`:
 ```json
 {
   "targets": [
-    { "alias": "merkle-devops", "name": "Merkle DevOps Team", "jid": "120363xxxxxxxxx@g.us", "enabled": true },
-    { "alias": "merkle-lead", "name": "Tech Lead Direct", "jid": "628123xxxxxxx@s.whatsapp.net", "enabled": true }
+    { "alias": "devops-team", "name": "DevOps Team", "jid": "120363xxxxxxxxx@g.us", "enabled": true },
+    { "alias": "tech-lead", "name": "Tech Lead Direct", "jid": "628123xxxxxxx@s.whatsapp.net", "enabled": true }
   ]
 }
 ```
@@ -69,14 +69,14 @@ Edit `targets.json`:
 First run — interactive QR auth (needs a TTY):
 
 ```bash
-node index.js --target merkle-devops --auth-dir ./auth_info
+node index.js --target devops-team --auth-dir ./auth_info
 # scan the QR under WhatsApp → Settings → Linked devices
 ```
 
 Then:
 
 ```bash
-node index.js --target merkle-devops --window 60 --auth-dir ./auth_info | jq .
+node index.js --target devops-team --window 60 --auth-dir ./auth_info | jq .
 node index.js --jid '628123xxxxxxx@s.whatsapp.net' --window 30 --auth-dir ./auth_info
 node index.js --all --window 60 --auth-dir ./auth_info
 ```
@@ -92,6 +92,7 @@ node index.js --all --window 60 --auth-dir ./auth_info
 | `--wait <seconds>` | `30` | max wait for history sync |
 | `--timeout <seconds>` | `120` | global watchdog |
 | `--auth-dir <path>` | `/app/auth_info` | Baileys credentials |
+| `--topic <name>` | `general` | Telegram topic for routing intent |
 | `--strict` | off | exit 3 when any result is PARTIAL |
 
 Exactly one of `--target` / `--jid` / `--all` is required.
@@ -102,8 +103,8 @@ Output (single target):
 {
   "status": "OK",
   "meta": {
-    "target_alias": "merkle-devops",
-    "destination_telegram_topic": "Merkle",
+    "target_alias": "devops-team",
+    "destination_telegram_topic": "general",
     "time_window_minutes": 60,
     "extracted_at": "2026-10-07T12:30:00.000Z",
     "total_messages": 1,
@@ -143,7 +144,7 @@ the result to `PARTIAL`).
 ```bash
 docker compose build
 # first run: interactive QR (needs a TTY), creds land in the wa_auth_data volume
-docker compose run --rm extractor --target merkle-devops --window 60
+docker compose run --rm extractor --target devops-team --window 60
 # routine runs
 docker compose run --rm extractor --all --window 60 | jq .
 ```
@@ -154,44 +155,44 @@ runs as UID 65532, `read_only: true`, `cap_drop: ALL`,
 `no-new-privileges`, `targets.json` mounted `:ro`, auth in a named volume
 pre-seeded with the right ownership (see ADR-002 in the vault).
 
-## Hermes cron → Telegram topic Merkle
+## Hermes cron → Telegram topic
 
 Prereqs on the VPS: `mkdir -p ~/.hermes/scripts`, Hermes Telegram
-connected, a forum topic named **Merkle** (long-press header → Copy link →
+connected, a forum topic (long-press header → Copy link →
 trailing integer is the thread id).
 
-Gate script `~/.hermes/scripts/wa-merkle-gate.sh` (flock-guarded — two runs
+Gate script `~/.hermes/scripts/wa-gate.sh` (flock-guarded — two runs
 must never share the auth volume):
 
 ```bash
 #!/usr/bin/env bash
 set -eu
-OUT=/tmp/wa-merkle.json
-flock -n /tmp/wa-merkle.lock \
+OUT=/tmp/wa-out.json
+flock -n /tmp/wa-gate.lock \
   docker compose -f ~/wa-message-extractor/docker-compose.yml run --rm extractor --all --window 60 > "$OUT" 2>/dev/null || exit $?
 TOTAL=$(jq -r '.meta.total_messages // 0' "$OUT")
 STATUS=$(jq -r '.status' "$OUT")
 if [ "$TOTAL" -gt 0 ]; then
-  cp "$OUT" ~/.hermes/cron/output/wa-merkle-latest.json
-  printf '{"wakeAgent": true, "context": {"status": "%s", "total_messages": %s, "file": "wa-merkle-latest.json"}}\n' "$STATUS" "$TOTAL"
+  cp "$OUT" ~/.hermes/cron/output/wa-latest.json
+  printf '{"wakeAgent": true, "context": {"status": "%s", "total_messages": %s, "file": "wa-latest.json"}}\n' "$STATUS" "$TOTAL"
 else
   printf '{"wakeAgent": false}\n'
 fi
 ```
 
 Schedule an **LLM-driven** job with the gate attached (empty hours cost $0,
-busy hours get a real summary in the Merkle topic):
+busy hours get a real summary in the topic):
 
 ```bash
 hermes cron create "0 * * * *" \
-  "Read ~/.hermes/cron/output/wa-merkle-latest.json and post a concise summary \
-   of the new WhatsApp messages to the Merkle topic, flagging anything that needs action." \
-  --script wa-merkle-gate.sh \
+  "Read ~/.hermes/cron/output/wa-latest.json and post a concise summary \
+   of the new WhatsApp messages to the topic, flagging anything that needs action." \
+  --script wa-gate.sh \
   --deliver telegram:<chat_id>:<thread_id> \
-  --name wa-merkle-hourly
+  --name wa-hourly
 ```
 
-`--deliver telegram:<chat_id>:<thread_id>` addresses the Merkle topic
+`--deliver telegram:<chat_id>:<thread_id>` addresses the topic
 directly; alternatively set `TELEGRAM_CRON_THREAD_ID=<thread_id>` in the
 Hermes `.env`. To silence the root chat entirely, enable Telegram topic mode
 per the Hermes docs.

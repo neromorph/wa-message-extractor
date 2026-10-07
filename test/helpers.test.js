@@ -212,22 +212,34 @@ describe("buildTargetResult", () => {
 
   it("returns OK with the spec meta fields", () => {
     const result = buildTargetResult({
-      target: { alias: "merkle-devops" },
+      target: { alias: "devops-team" },
       messages: [],
       windowMinutes: 60,
       extractedAt: "2026-10-07T12:30:00.000Z",
       historySync,
     });
     assert.equal(result.status, "OK");
-    assert.equal(result.meta.target_alias, "merkle-devops");
-    assert.equal(result.meta.destination_telegram_topic, "Merkle");
+    assert.equal(result.meta.target_alias, "devops-team");
+    assert.equal(result.meta.destination_telegram_topic, "general");
     assert.equal(result.meta.time_window_minutes, 60);
     assert.equal(result.meta.total_messages, 0);
   });
 
+  it("honours a custom topic", () => {
+    const result = buildTargetResult({
+      target: { alias: "devops-team" },
+      messages: [],
+      windowMinutes: 60,
+      extractedAt: "2026-10-07T12:30:00.000Z",
+      topic: "ops-alerts",
+      historySync,
+    });
+    assert.equal(result.meta.destination_telegram_topic, "ops-alerts");
+  });
+
   it("marks PARTIAL when the hard cap stopped the sync", () => {
     const result = buildTargetResult({
-      target: { alias: "merkle-devops" },
+      target: { alias: "devops-team" },
       messages: [],
       windowMinutes: 60,
       extractedAt: "2026-10-07T12:30:00.000Z",
@@ -269,9 +281,11 @@ describe("buildEnvelope", () => {
       results: [ok, partial],
       windowMinutes: 60,
       extractedAt: "2026-10-07T12:30:00.000Z",
+      topic: "general",
       historySync: ok.meta.history_sync,
     });
     assert.equal(envelope.status, "PARTIAL");
+    assert.equal(envelope.meta.destination_telegram_topic, "general");
     assert.equal(envelope.meta.target_count, 2);
     assert.equal(envelope.meta.total_messages, 1);
     assert.equal(envelope.results.length, 2);
