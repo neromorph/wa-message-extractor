@@ -221,11 +221,15 @@ docker compose config --format json | jq -e '.services.extractor.read_only == tr
 ## Releases & deploy
 
 - Push to `main` → build, scan, push `:edge` + `:sha-xxxxxxx` (no deploy).
-- Tag `v*` → push `:X.Y.Z`, `:X.Y`, `:latest`, then SSH to the VPS over the
-  tailnet and `git pull --ff-only && docker compose pull`.
-- Rollback: re-tag an older `:sha-xxxxxxx`.
-- Secrets: `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`, `TS_AUTHKEY`,
-  `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`. Third-party actions are SHA-pinned.
+- Tag `v*` → push `:X.Y.Z`, `:X.Y`, `:latest`. No auto-deploy: pull manually.
+- Deploy (manual, on the VPS):
+  ```bash
+  cd ~/wa-message-extractor
+  git pull --ff-only
+  docker compose pull
+  ```
+- Rollback: re-tag an older `:sha-xxxxxxx`, or `git checkout vX` + `compose pull`.
+- Secrets: `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`. Third-party actions are SHA-pinned.
 
 ## Troubleshooting
 

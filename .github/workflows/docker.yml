@@ -122,25 +122,3 @@ jobs:
         with:
           name: sbom-${{ github.ref_name }}
           path: sbom.cdx.json
-
-  deploy:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    steps:
-      - uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
-        with:
-          authkey: ${{ secrets.TS_AUTHKEY }}
-      - name: Pull on nisnmfd
-        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_SSH_KEY }}
-          script: |
-            set -eu
-            cd ~/wa-message-extractor
-            git pull --ff-only
-            docker compose pull
-            docker compose config --format json | jq -e '.services.extractor.read_only == true' >/dev/null
-            echo "deployed ${{ github.ref_name }}"
