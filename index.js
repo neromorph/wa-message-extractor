@@ -687,6 +687,21 @@ async function listGroups(input) {
   return formatGroupList(all);
 }
 
+/**
+ * Authenticate only: connect (QR on first run), save creds, close, exit.
+ * No history sync, no queries.
+ */
+async function authOnly(input) {
+  const { sock } = await openSocket(input.authDir);
+  try {
+    await waitForOpen(sock, input.interactive);
+  } catch (failure) {
+    closeSocket(sock);
+    throw failure;
+  }
+  closeSocket(sock);
+}
+
 const LOGGED_OUT_MESSAGE =
   "WhatsApp session logged out (401). Delete the auth directory contents and re-run interactively to scan a fresh QR code. Credentials were NOT deleted automatically.";
 
@@ -703,6 +718,7 @@ function buildProgram() {
     .option("--jid <jid>", "process a single direct JID")
     .option("--all", "process all enabled targets from targets.json")
     .option("--list-groups", "list all participating groups as JSON and exit")
+    .option("--auth", "authenticate only: scan QR, save creds, exit")
     .option("--window <minutes>", "time window in minutes", String(DEFAULT_WINDOW_MINUTES))
     .option("--wait <seconds>", "max seconds to wait for history sync", String(DEFAULT_WAIT_SECS))
     .option(
@@ -740,6 +756,7 @@ async function main(argv) {
     opts.jid,
     opts.all ? "all" : undefined,
     opts.listGroups ? "list" : undefined,
+    opts.auth ? "auth" : undefined,
   ].filter((value) => value !== undefined);
   if (selectors.length === 0) {
     program.help();
@@ -747,7 +764,7 @@ async function main(argv) {
   }
   if (selectors.length > 1) {
     writeStdoutJson(
-      errorPayload("Pass exactly one of --target, --jid, --all, or --list-groups.", base),
+      errorPayload("Pass exactly one of --target, --jid, --all, --list-groups, or --auth.", base),
       EXIT_ERROR,
     );
     return;
@@ -824,6 +841,35 @@ async function main(argv) {
     writeStdoutJson(
       { status: "NEEDS_AUTH", message: "Run interactively to scan QR code." },
       EXIT_NEEDS_AUTH,
+    );
+    return;
+  }
+
+  // Auth-only mode: no targets.json, no history, no queries.
+  if (opts.auth) {
+    try {
+      await authOnly({ authDir: opts.authDir, interactive });
+    } catch (failure) {
+      const code = failure && typeof failure.code === "number" ? failure.code : undefined;
+      if (code === DisconnectReason.loggedOut) {
+        writeStdoutJson(errorPayload(LOGGED_OUT_MESSAGE, base), EXIT_ERROR);
+      } else {
+        const detail = failure && failure.error ? String(failure.error) : `disconnect code ${code}`;
+        writeStdoutJson(errorPayload(`Authentication failed: ${detail}`, base), EXIT_ERROR);
+      }
+      return;
+    }
+    logger.info("authenticated, credentials saved");
+    writeStdoutJson(
+      {
+        status: "OK",
+        meta: {
+          destination_telegram_topic: topic,
+          authenticated_at: new Date().toISOString(),
+        },
+        message: "WhatsApp session authenticated and saved.",
+      },
+      EXIT_OK,
     );
     return;
   }

@@ -94,6 +94,7 @@ node index.js --all --window 60 --auth-dir ./auth_info
 | `--auth-dir <path>` | `/app/auth_info` | Baileys credentials |
 | `--topic <name>` | `general` | Telegram topic for routing intent |
 | `--list-groups` | — | list all participating groups (JID + name) as JSON and exit |
+| `--auth` | — | authenticate only: scan QR, save creds, exit |
 | `--strict` | off | exit 3 when any result is PARTIAL |
 
 Exactly one of `--target` / `--jid` / `--all` / `--list-groups` is required.
