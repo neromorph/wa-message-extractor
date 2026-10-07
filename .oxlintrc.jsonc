@@ -1,0 +1,46 @@
+{
+  // Oxlint config. .jsonc allows comments — JSON schema via node_modules.
+  // "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "ignorePatterns": [
+    ".husky/**",
+    "tools/oxlint/anti-slop/**",
+    "tools/oxlint/wa-readonly/**",
+    "node_modules/**"
+  ],
+  "jsPlugins": [
+    { "name": "anti-slop", "specifier": "./tools/oxlint/anti-slop/index.ts" },
+    { "name": "wa-readonly", "specifier": "./tools/oxlint/wa-readonly/index.ts" }
+  ],
+  "rules": {
+    // Generic anti-slop (15 rules, error). In plain .js most are inert
+    // (they walk TSType nodes) — see ADR-003. They activate on first .ts file.
+    "anti-slop/no-chained-type-assertions": "error",
+    "anti-slop/no-conditional-empty-object-spread": "error",
+    "anti-slop/no-known-value-widening": "error",
+    "anti-slop/no-module-mocking": "error",
+    "anti-slop/no-object-parameters": "error",
+    "anti-slop/no-reflect-apply": "error",
+    "anti-slop/no-reflect-get": "error",
+    "anti-slop/no-runtime-typeof": "error",
+    "anti-slop/no-shape-in-symbol-names": "error",
+    "anti-slop/no-unknown-parameters": "error",
+    "anti-slop/no-unknown-returns": "error",
+    "anti-slop/no-unknown-type-aliases": "error",
+    "anti-slop/no-unsafe-dictionary-type": "error",
+    "anti-slop/no-widen-then-assert": "error",
+    "anti-slop/require-safety-comment-for-type-assertion": "error",
+    // Project read-only guard — AST-accurate, no string false-positives.
+    "wa-readonly/no-whatsapp-mutation": "error"
+  },
+  "overrides": [
+    {
+      // Verified 2026-10-07 (oxlint 1.87.0): JSDoc `@returns {value is T}`
+      // type predicates are NOT honoured, so allowInTypeGuards cannot work
+      // in plain JS. JSON boundary validators legitimately use `typeof`;
+      // scope the rule off for .js, keep it live for future .ts files.
+      // See vault ADR-003.
+      "files": ["**/*.js"],
+      "rules": { "anti-slop/no-runtime-typeof": "off" }
+    }
+  ]
+}

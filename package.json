@@ -1,0 +1,35 @@
+{
+  "name": "wa-message-extractor",
+  "version": "0.1.0",
+  "description": "Secure, production-ready, read-only WhatsApp message extractor CLI",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "main": "index.js",
+  "bin": {
+    "wa-message-extractor": "index.js"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test test/*.test.js",
+    "lint": "oxlint --config .oxlintrc.jsonc",
+    "lint:fix": "oxlint --config .oxlintrc.jsonc --fix",
+    "verify": "npm run lint && npm test",
+    "security": "./tools/security-scan.sh",
+    "setup:hooks": "npx husky",
+    "prepare": "husky"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "7.0.0-rc14",
+    "commander": "15.0.0",
+    "pino": "10.4.0",
+    "qrcode-terminal": "0.12.0"
+  },
+  "devDependencies": {
+    "@oxlint/plugins": "1.87.0",
+    "husky": "9.1.7",
+    "oxlint": "1.87.0"
+  }
+}

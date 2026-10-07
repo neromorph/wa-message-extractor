@@ -1,0 +1,23 @@
+services:
+  extractor:
+    build: .
+    image: neromorph/wa-message-extractor:latest
+    user: "65532:65532"
+    restart: "no"
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - wa_auth_data:/app/auth_info
+      - ./targets.json:/app/targets.json:ro
+    # One-shot CLI: pass args after the service name, e.g.
+    # docker compose run --rm extractor --all --window 60
+    # No `command` here so args append to ENTRYPOINT.
+
+volumes:
+  wa_auth_data: {}

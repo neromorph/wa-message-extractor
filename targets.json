@@ -1,0 +1,16 @@
+{
+  "targets": [
+    {
+      "alias": "merkle-devops",
+      "name": "Merkle DevOps Team",
+      "jid": "120363000000000000@g.us",
+      "enabled": true
+    },
+    {
+      "alias": "merkle-lead",
+      "name": "Tech Lead Direct",
+      "jid": "6281200000000@s.whatsapp.net",
+      "enabled": true
+    }
+  ]
+}

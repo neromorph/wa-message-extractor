@@ -1,0 +1,3 @@
+# Accepted trivy findings. Each entry must carry a date + reason.
+# Format: one CVE or check ID per line, e.g.
+#   CVE-2026-12345 # 2026-10-07: base image only, unreachable (no server listens)

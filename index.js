@@ -1,0 +1,976 @@
+#!/usr/bin/env node
+/**
+ * wa-message-extractor — secure, read-only WhatsApp message extractor.
+ *
+ * Flow: authenticate -> fetch history within window -> format JSON -> stdout -> exit.
+ *
+ * READ-ONLY CONTRACT (enforced, not just promised):
+ *  1. The raw Baileys socket never escapes `connectOnce()` — callers only get
+ *     a narrow handle (`on`, `groupMetadata`, `close`, `me`).
+ *  2. That handle is a Proxy that throws on any mutating method name.
+ *  3. `tools/oxlint/wa-readonly` flags mutating call sites at lint time.
+ *
+ * This module never calls: sendMessage, sendReceipt(s), readMessages,
+ * chatModify, logout, presence updates, group management, or profile edits.
+ * It also never deletes credentials or unlinks the device.
+ *
+ * stdout carries ONLY the JSON payload. Logs, QR codes and progress go to
+ * stderr so `node index.js --all | jq` and Hermes no-agent delivery work.
+ */
+
+import makeWASocket, {
+  Browsers,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore,
+  proto,
+  useMultiFileAuthState,
+} from "@whiskeysockets/baileys";
+import { Command } from "commander";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import pino from "pino";
+import qrcode from "qrcode-terminal";
+
+const TELEGRAM_TOPIC = "Merkle";
+const SETTLE_MS = 3000;
+const DEFAULT_WINDOW_MINUTES = 60;
+const DEFAULT_WAIT_SECS = 30;
+const DEFAULT_GLOBAL_TIMEOUT_SECS = 120;
+const MAX_RECONNECTS = 3;
+
+const EXIT_OK = 0;
+const EXIT_ERROR = 1;
+const EXIT_NEEDS_AUTH = 2;
+const EXIT_PARTIAL_STRICT = 3;
+
+// Keep in sync with tools/oxlint/wa-readonly/index.ts (MUTATING_METHODS).
+export const MUTATING_METHODS = [
+  "sendMessage",
+  "sendReceipt",
+  "sendReceipts",
+  "readMessages",
+  "chatModify",
+  "sendPresenceUpdate",
+  "presenceSubscribe",
+  "updateProfileStatus",
+  "updateProfileName",
+  "updateProfilePicture",
+  "removeProfilePicture",
+  "fetchPrivacySettings",
+  "updateBlockStatus",
+  "updateLastSeenPrivacy",
+  "updateOnlinePrivacy",
+  "updateReadReceiptsPrivacy",
+  "updateGroupsAddPrivacy",
+  "updateDefaultDisappearingMode",
+  "groupCreate",
+  "groupLeave",
+  "groupUpdateSubject",
+  "groupUpdateDescription",
+  "groupParticipantsUpdate",
+  "groupSettingUpdate",
+  "groupInviteCode",
+  "groupRevokeInvite",
+  "groupAcceptInvite",
+  "groupGetInviteInfo",
+  "newsletterCreate",
+  "newsletterUpdate",
+  "newsletterDelete",
+  "newsletterReact",
+  "newsletterFollow",
+  "newsletterUnfollow",
+  "newsletterMute",
+  "newsletterUnmute",
+  "logout",
+  "requestPairingCode",
+];
+
+const logger = pino(
+  { level: process.env.LOG_LEVEL || "info" },
+  process.stderr,
+);
+
+// ---------------------------------------------------------------------------
+// Read-only socket wrapper
+// ---------------------------------------------------------------------------
+
+/**
+ * Wrap a Baileys socket so any access to a mutating method throws.
+ * Only plain property reads are forwarded (no Reflect — see ADR-003).
+ */
+export function createReadOnlySocket(sock) {
+  const denied = new Set(MUTATING_METHODS);
+  return new Proxy(sock, {
+    get(target, prop, _receiver) {
+      if (denied.has(prop)) {
+        throw new Error(
+          `Read-only violation: socket.${String(prop)} is blocked. ` +
+            "This extractor must never mutate WhatsApp state.",
+        );
+      }
+      const value = target[prop];
+      if (typeof value === "function") {
+        return value.bind(target);
+      }
+      return value;
+    },
+    set(_target, prop, _value) {
+      throw new Error(
+        `Read-only violation: cannot set socket.${String(prop)}.`,
+      );
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Message parsing (pure helpers — unit tested)
+// ---------------------------------------------------------------------------
+
+const WRAPPER_KEYS = new Set([
+  "ephemeralMessage",
+  "viewOnceMessage",
+  "viewOnceMessageV2",
+  "viewOnceMessageV2Extension",
+  "documentWithCaptionMessage",
+  "editedMessage",
+]);
+
+function unwrapMessage(message) {
+  let current = message;
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (current === null || current === undefined) {
+      return undefined;
+    }
+    let descended = false;
+    for (const key of WRAPPER_KEYS) {
+      const wrapper = current[key];
+      if (wrapper !== null && wrapper !== undefined && wrapper.message) {
+        current = wrapper.message;
+        descended = true;
+        break;
+      }
+    }
+    if (!descended) {
+      return current;
+    }
+  }
+  return current;
+}
+
+/**
+ * Extract display text and a coarse type from a WAMessage.
+ * Media is never downloaded — captions only, otherwise text is null.
+ */
+export function extractMessageText(wam) {
+  const message = unwrapMessage(wam.message);
+  if (message === null || message === undefined) {
+    return { text: null, message_type: "unknown" };
+  }
+  if (message.conversation) {
+    return { text: message.conversation, message_type: "text" };
+  }
+  const ext = message.extendedTextMessage;
+  if (ext && ext.text) {
+    return { text: ext.text, message_type: "text" };
+  }
+  const image = message.imageMessage;
+  if (image) {
+    return { text: image.caption || null, message_type: "image" };
+  }
+  const video = message.videoMessage;
+  if (video) {
+    return { text: video.caption || null, message_type: "video" };
+  }
+  const doc = message.documentMessage;
+  if (doc) {
+    return { text: doc.caption || null, message_type: "document" };
+  }
+  if (message.audioMessage) {
+    return { text: null, message_type: "audio" };
+  }
+  if (message.stickerMessage) {
+    return { text: null, message_type: "sticker" };
+  }
+  const reaction = message.reactionMessage;
+  if (reaction) {
+    return { text: reaction.text || null, message_type: "reaction" };
+  }
+  const poll = message.pollCreationMessage || message.pollCreationMessageV2 || message.pollCreationMessageV3;
+  if (poll) {
+    return { text: poll.name || null, message_type: "poll" };
+  }
+  const buttons = message.buttonsResponseMessage;
+  if (buttons) {
+    return {
+      text: buttons.selectedDisplayText || buttons.selectedButtonId || null,
+      message_type: "buttons_response",
+    };
+  }
+  const list = message.listResponseMessage;
+  if (list) {
+    return { text: list.title || null, message_type: "list_response" };
+  }
+  const template = message.templateButtonReplyMessage;
+  if (template) {
+    return { text: template.selectedId || null, message_type: "template_reply" };
+  }
+  if (message.locationMessage) {
+    return { text: null, message_type: "location" };
+  }
+  if (message.liveLocationMessage) {
+    return { text: null, message_type: "live_location" };
+  }
+  if (message.contactMessage) {
+    return { text: null, message_type: "contact" };
+  }
+  const keys = Object.keys(message);
+  const firstKey = keys.length > 0 ? keys[0] : "unknown";
+  return { text: null, message_type: firstKey };
+}
+
+export function messageTimestampMs(wam) {
+  const raw = wam.messageTimestamp;
+  const asNumber = Number(raw);
+  if (Number.isNaN(asNumber) || asNumber <= 0) {
+    return 0;
+  }
+  return asNumber * 1000;
+}
+
+/** Group messages carry participant; DMs carry the peer in remoteJid. */
+export function senderJidOf(wam) {
+  const key = wam.key || {};
+  if (key.participant) {
+    return key.participant;
+  }
+  return key.remoteJid || "unknown";
+}
+
+/**
+ * Sender display name precedence:
+ * pushName -> history contact name/notify -> group participant notify/name
+ * -> JID local part.
+ */
+export function resolveSenderName(parts) {
+  const bag = parts || {};
+  if (bag.pushName) {
+    return bag.pushName;
+  }
+  if (bag.contactName) {
+    return bag.contactName;
+  }
+  if (bag.contactNotify) {
+    return bag.contactNotify;
+  }
+  if (bag.participantNotify) {
+    return bag.participantNotify;
+  }
+  if (bag.participantName) {
+    return bag.participantName;
+  }
+  const jid = bag.fallbackJid || "unknown";
+  const local = jid.split("@")[0];
+  if (local) {
+    return local;
+  }
+  return "unknown";
+}
+
+/** Keep messages at/after the cutoff. Unknown timestamps are dropped. */
+export function filterByWindow(messages, cutoffMs) {
+  return messages.filter((wam) => {
+    const ts = messageTimestampMs(wam);
+    return ts > 0 && ts >= cutoffMs;
+  });
+}
+
+export function normalizeMessage(wam, context) {
+  const ctx = context || {};
+  const senderJid = senderJidOf(wam);
+  const extracted = extractMessageText(wam);
+  const contact = ctx.contacts ? ctx.contacts.get(senderJid) : undefined;
+  const participant = ctx.participants ? ctx.participants.get(senderJid) : undefined;
+  const name = resolveSenderName({
+    pushName: wam.pushName,
+    contactName: contact ? contact.name : undefined,
+    contactNotify: contact ? contact.notify : undefined,
+    participantNotify: participant ? participant.notify : undefined,
+    participantName: participant ? participant.name : undefined,
+    fallbackJid: senderJid,
+  });
+  return {
+    sender_jid: senderJid,
+    sender_name: name,
+    from_me: Boolean(wam.key && wam.key.fromMe),
+    timestamp: new Date(messageTimestampMs(wam)).toISOString(),
+    text: extracted.text,
+    message_type: extracted.message_type,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Result builders (pure — unit tested)
+// ---------------------------------------------------------------------------
+
+export function buildTargetResult(input) {
+  const total = input.messages.length;
+  const sync = input.historySync || {};
+  const partial = sync.stopped_by === "cap";
+  return {
+    status: partial ? "PARTIAL" : "OK",
+    meta: {
+      target_alias: input.target.alias,
+      destination_telegram_topic: TELEGRAM_TOPIC,
+      time_window_minutes: input.windowMinutes,
+      extracted_at: input.extractedAt,
+      total_messages: total,
+      history_sync: input.historySync,
+    },
+    messages: input.messages,
+  };
+}
+
+export function buildEnvelope(inputs) {
+  const results = inputs.results;
+  let total = 0;
+  let partials = 0;
+  for (const result of results) {
+    total += result.meta.total_messages;
+    if (result.status === "PARTIAL") {
+      partials += 1;
+    }
+  }
+  let status = "OK";
+  if (partials > 0) {
+    status = "PARTIAL";
+  }
+  if (results.length > 0 && partials === results.length) {
+    status = "PARTIAL";
+  }
+  return {
+    status,
+    meta: {
+      destination_telegram_topic: TELEGRAM_TOPIC,
+      time_window_minutes: inputs.windowMinutes,
+      extracted_at: inputs.extractedAt,
+      target_count: results.length,
+      total_messages: total,
+      history_sync: inputs.historySync,
+    },
+    results,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Config loading (lazy — --jid works without targets.json)
+// ---------------------------------------------------------------------------
+
+function targetsPath() {
+  return fileURLToPath(new URL("./targets.json", import.meta.url));
+}
+
+export function loadTargetsFile(customPath) {
+  const path = customPath || targetsPath();
+  let stat;
+  try {
+    stat = statSync(path);
+  } catch (error) {
+    if (error && error.code === "ENOENT") {
+      throw new Error(
+        `targets.json not found at ${path}. ` +
+          "Create it from the README sample or use --jid for a direct JID.",
+      );
+    }
+    throw error;
+  }
+  if (stat.isDirectory()) {
+    throw new Error(
+      `targets.json at ${path} is a directory. ` +
+        "Docker creates a directory when the host file is missing — " +
+        "create ./targets.json on the host and re-run.",
+    );
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    throw new Error(`targets.json at ${path} is not valid JSON.`);
+  }
+  const list = parsed.targets;
+  if (!Array.isArray(list)) {
+    throw new Error('targets.json must contain a "targets" array.');
+  }
+  return list;
+}
+
+// ---------------------------------------------------------------------------
+// Output + process contract
+// ---------------------------------------------------------------------------
+
+let emitted = false;
+let watchdog = null;
+
+function clearWatchdog() {
+  if (watchdog) {
+    clearTimeout(watchdog);
+    watchdog = null;
+  }
+}
+
+export function armWatchdog(timeoutSecs, onFire) {
+  clearWatchdog();
+  watchdog = setTimeout(onFire, timeoutSecs * 1000);
+}
+
+function writeStdoutJson(payload, exitCode) {
+  if (emitted) {
+    return;
+  }
+  emitted = true;
+  clearWatchdog();
+  const pretty = Boolean(process.stdout.isTTY);
+  const body = pretty ? JSON.stringify(payload, null, 2) : JSON.stringify(payload);
+  process.stdout.write(`${body}\n`, () => {
+    process.exit(exitCode);
+  });
+}
+
+function exitCodeForStatus(status, strict) {
+  if (status === "OK") {
+    return EXIT_OK;
+  }
+  if (status === "PARTIAL") {
+    return strict ? EXIT_PARTIAL_STRICT : EXIT_OK;
+  }
+  if (status === "NEEDS_AUTH") {
+    return EXIT_NEEDS_AUTH;
+  }
+  return EXIT_ERROR;
+}
+
+function errorPayload(message, base) {
+  const payload = { status: "ERROR", message };
+  if (base) {
+    payload.meta = {
+      destination_telegram_topic: TELEGRAM_TOPIC,
+      time_window_minutes: base.windowMinutes,
+      extracted_at: new Date().toISOString(),
+    };
+  }
+  return payload;
+}
+
+// ---------------------------------------------------------------------------
+// Baileys connection (the only place the raw socket exists)
+// ---------------------------------------------------------------------------
+
+function syncTypeName(value) {
+  const table = proto.HistorySync.HistorySyncType;
+  for (const name of Object.keys(table)) {
+    if (table[name] === value) {
+      return name;
+    }
+  }
+  return String(value);
+}
+
+function disconnectCode(error) {
+  if (error && error.output && typeof error.output.statusCode === "number") {
+    return error.output.statusCode;
+  }
+  return undefined;
+}
+
+function closeSocket(sock) {
+  try {
+    if (typeof sock.end === "function") {
+      const done = sock.end(undefined);
+      if (done && typeof done.catch === "function") {
+        done.catch(() => {});
+      }
+      return;
+    }
+  } catch {
+    // fall through to ws close
+  }
+  try {
+    if (sock.ws && typeof sock.ws.close === "function") {
+      sock.ws.close();
+    }
+  } catch {
+    // already closing — nothing to do
+  }
+}
+
+/**
+ * Open one connection, collect history + live messages for the target JIDs,
+ * then resolve. Rejects with { fatal, message } on unrecoverable errors.
+ */
+async function connectOnce(input) {
+  const { state, saveCreds } = await useMultiFileAuthState(input.authDir);
+  const { version } = await fetchLatestBaileysVersion();
+
+  const sock = makeWASocket({
+    version,
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, logger),
+    },
+    logger,
+    browser: Browsers.ubuntu("Chrome"),
+    markOnlineOnConnect: false,
+    emitOwnEvents: false,
+    syncFullHistory: false,
+    getMessage: async () => undefined,
+  });
+  const safe = createReadOnlySocket(sock);
+  sock.ev.on("creds.update", saveCreds);
+
+  const targetJids = new Set(input.targets.map((target) => target.jid));
+  const collected = [];
+  const contacts = new Map();
+  const syncTypes = new Set();
+  let chunks = 0;
+  let statusComplete = false;
+  let explicitComplete = false;
+  let notifyChunk = () => {};
+  let notifyStatus = () => {};
+
+  const isWanted = (wam) => {
+    const remote = wam.key ? wam.key.remoteJid : undefined;
+    return Boolean(remote && targetJids.has(remote));
+  };
+
+  sock.ev.on("messaging-history.set", ({ chats, contacts: fresh, messages, syncType }) => {
+    void chats;
+    if (Array.isArray(fresh)) {
+      for (const contact of fresh) {
+        if (contact && contact.id) {
+          contacts.set(contact.id, { name: contact.name, notify: contact.notify });
+        }
+      }
+    }
+    if (typeof syncType === "number") {
+      syncTypes.add(syncTypeName(syncType));
+    }
+    if (Array.isArray(messages)) {
+      chunks += 1;
+      for (const wam of messages) {
+        if (isWanted(wam)) {
+          collected.push(wam);
+        }
+      }
+      notifyChunk();
+    }
+  });
+
+  sock.ev.on("messages.upsert", ({ messages }) => {
+    if (Array.isArray(messages)) {
+      for (const wam of messages) {
+        if (isWanted(wam)) {
+          collected.push(wam);
+        }
+      }
+    }
+  });
+
+  sock.ev.on("messaging-history.status", ({ syncType, status, explicit }) => {
+    if (status === "complete") {
+      statusComplete = true;
+      if (explicit) {
+        explicitComplete = true;
+      }
+      if (typeof syncType === "number") {
+        syncTypes.add(syncTypeName(syncType));
+      }
+      logger.info({ syncType: syncTypeName(syncType), explicit }, "history sync complete");
+      notifyStatus();
+    }
+  });
+
+  const openPromise = new Promise((resolve, reject) => {
+    sock.ev.on("connection.update", (update) => {
+      const { connection, lastDisconnect, qr } = update;
+      if (qr) {
+        if (input.interactive) {
+          logger.info("Scan the QR code below with WhatsApp (Linked devices).");
+          qrcode.generate(qr, { small: true }, (code) => {
+            process.stderr.write(`${code}\n`);
+          });
+        } else {
+          logger.warn("QR requested but stdout is not a TTY — cannot display it.");
+        }
+      }
+      if (connection === "open") {
+        resolve();
+      }
+      if (connection === "close") {
+        const code = disconnectCode(lastDisconnect ? lastDisconnect.error : undefined);
+        reject({ code, error: lastDisconnect ? lastDisconnect.error : undefined });
+      }
+    });
+  });
+
+  // connection.update "close" during the sync window must abort the wait
+  let abortSync = null;
+  const closeWatcher = (update) => {
+    if (update.connection === "close" && abortSync) {
+      const code = disconnectCode(
+        update.lastDisconnect ? update.lastDisconnect.error : undefined,
+      );
+      abortSync({ code });
+    }
+  };
+  sock.ev.on("connection.update", closeWatcher);
+
+  try {
+    await openPromise;
+  } catch (failure) {
+    closeSocket(sock);
+    throw failure;
+  }
+
+  const cutoffMs = Date.now() - input.windowMinutes * 60 * 1000;
+
+  // Best-effort participant names for group targets (read query, not a mutation).
+  const participants = new Map();
+  await Promise.all(
+    input.targets.map(async (target) => {
+      if (!target.jid.endsWith("@g.us")) {
+        return;
+      }
+      try {
+        const meta = await Promise.race([
+          safe.groupMetadata(target.jid),
+          new Promise((_, reject) => {
+            setTimeout(() => reject(new Error("groupMetadata timeout")), 10000);
+          }),
+        ]);
+        const list = meta && Array.isArray(meta.participants) ? meta.participants : [];
+        for (const participant of list) {
+          if (participant && participant.id && !participants.has(participant.id)) {
+            participants.set(participant.id, {
+              name: participant.name,
+              notify: participant.notify,
+            });
+          }
+        }
+      } catch (error) {
+        logger.warn({ jid: target.jid, error: String(error) }, "group metadata unavailable");
+      }
+    }),
+  );
+
+  const syncResult = await new Promise((resolve, reject) => {
+    let done = false;
+    const finish = (stoppedBy) => {
+      if (done) {
+        return;
+      }
+      done = true;
+      clearTimeout(capTimer);
+      clearTimeout(quietTimer);
+      resolve({ stoppedBy });
+    };
+    abortSync = (failure) => {
+      if (done) {
+        return;
+      }
+      done = true;
+      clearTimeout(capTimer);
+      clearTimeout(quietTimer);
+      reject(failure);
+    };
+    const capTimer = setTimeout(() => finish("cap"), input.waitSecs * 1000);
+    let quietTimer = null;
+    const armQuiet = () => {
+      if (quietTimer) {
+        clearTimeout(quietTimer);
+      }
+      quietTimer = setTimeout(() => {
+        if (chunks > 0 || statusComplete) {
+          finish(statusComplete ? "status" : "silence");
+        }
+      }, SETTLE_MS);
+    };
+    notifyChunk = armQuiet;
+    notifyStatus = () => {
+      armQuiet();
+    };
+    // Seed the quiet timer in case history already arrived before open.
+    if (chunks > 0) {
+      armQuiet();
+    }
+  });
+
+  closeSocket(sock);
+
+  return {
+    collected,
+    contacts,
+    participants,
+    cutoffMs,
+    historySync: {
+      chunks_received: chunks,
+      messages_seen: collected.length,
+      sync_types: Array.from(syncTypes).sort(),
+      completed_explicitly: explicitComplete,
+      stopped_by: syncResult.stoppedBy,
+    },
+  };
+}
+
+function describeTargets(targets) {
+  return targets.map((target) => target.alias).join(", ");
+}
+
+// ---------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------
+
+function buildProgram() {
+  const program = new Command();
+  program
+    .name("wa-message-extractor")
+    .description("Read-only WhatsApp message extractor (JSON to stdout).")
+    .option("--target <alias>", "process a single target by alias from targets.json")
+    .option("--jid <jid>", "process a single direct JID")
+    .option("--all", "process all enabled targets from targets.json")
+    .option("--window <minutes>", "time window in minutes", String(DEFAULT_WINDOW_MINUTES))
+    .option("--wait <seconds>", "max seconds to wait for history sync", String(DEFAULT_WAIT_SECS))
+    .option(
+      "--timeout <seconds>",
+      "global watchdog in seconds",
+      String(DEFAULT_GLOBAL_TIMEOUT_SECS),
+    )
+    .option("--auth-dir <path>", "directory for Baileys auth tokens", "/app/auth_info")
+    .option("--strict", "exit 3 when any result is PARTIAL", false);
+  return program;
+}
+
+async function main(argv) {
+  const program = buildProgram();
+  program.parse(argv);
+  const opts = program.opts();
+
+  const windowMinutes = Number(opts.window);
+  const waitSecs = Number(opts.wait);
+  const timeoutSecs = Number(opts.timeout);
+  if (!Number.isFinite(windowMinutes) || windowMinutes <= 0) {
+    writeStdoutJson(errorPayload("--window must be a positive number of minutes."), EXIT_ERROR);
+    return;
+  }
+  if (!Number.isFinite(waitSecs) || waitSecs <= 0) {
+    writeStdoutJson(errorPayload("--wait must be a positive number of seconds."), EXIT_ERROR);
+    return;
+  }
+
+  const selectors = [opts.target, opts.jid, opts.all ? "all" : undefined].filter(
+    (value) => value !== undefined,
+  );
+  if (selectors.length === 0) {
+    program.help();
+    return;
+  }
+  if (selectors.length > 1) {
+    writeStdoutJson(
+      errorPayload("Pass exactly one of --target, --jid, or --all.", { windowMinutes }),
+      EXIT_ERROR,
+    );
+    return;
+  }
+
+  armWatchdog(timeoutSecs > 0 ? timeoutSecs : DEFAULT_GLOBAL_TIMEOUT_SECS, () => {
+    writeStdoutJson(
+      errorPayload("Global timeout reached before extraction completed.", { windowMinutes }),
+      EXIT_ERROR,
+    );
+  });
+
+  const onSignal = (signal) => {
+    logger.warn({ signal }, "interrupted");
+    writeStdoutJson(errorPayload(`Interrupted by ${signal}.`, { windowMinutes }), EXIT_ERROR);
+  };
+  process.once("SIGINT", () => onSignal("SIGINT"));
+  process.once("SIGTERM", () => onSignal("SIGTERM"));
+
+  // Resolve targets (lazy: --jid never touches targets.json).
+  let targets;
+  try {
+    if (opts.jid) {
+      targets = [{ alias: opts.jid, name: "Direct JID", jid: opts.jid, enabled: true }];
+    } else {
+      const list = loadTargetsFile();
+      if (opts.target) {
+        const found = list.find((entry) => entry.alias === opts.target);
+        if (!found) {
+          writeStdoutJson(
+            errorPayload(`Target alias "${opts.target}" not found in targets.json.`, {
+              windowMinutes,
+            }),
+            EXIT_ERROR,
+          );
+          return;
+        }
+        if (found.enabled === false) {
+          writeStdoutJson(
+            errorPayload(`Target alias "${opts.target}" is disabled in targets.json.`, {
+              windowMinutes,
+            }),
+            EXIT_ERROR,
+          );
+          return;
+        }
+        targets = [found];
+      } else {
+        targets = list.filter((entry) => entry.enabled !== false);
+        if (targets.length === 0) {
+          writeStdoutJson(
+            errorPayload("No enabled targets in targets.json.", { windowMinutes }),
+            EXIT_ERROR,
+          );
+          return;
+        }
+      }
+    }
+  } catch (error) {
+    writeStdoutJson(errorPayload(String(error.message || error), { windowMinutes }), EXIT_ERROR);
+    return;
+  }
+
+  for (const target of targets) {
+    if (!target.jid || (!target.jid.endsWith("@g.us") && !target.jid.endsWith("@s.whatsapp.net") && !target.jid.endsWith("@lid"))) {
+      writeStdoutJson(
+        errorPayload(`Target "${target.alias}" has an invalid JID: ${target.jid}`, {
+          windowMinutes,
+        }),
+        EXIT_ERROR,
+      );
+      return;
+    }
+  }
+
+  // Auth gate: no creds + non-interactive -> NEEDS_AUTH without opening a socket.
+  const interactive = Boolean(process.stdin.isTTY);
+  const credsPath = join(opts.authDir, "creds.json");
+  if (!existsSync(credsPath) && !interactive) {
+    writeStdoutJson(
+      { status: "NEEDS_AUTH", message: "Run interactively to scan QR code." },
+      EXIT_NEEDS_AUTH,
+    );
+    return;
+  }
+
+  let attempt = 0;
+  let collected = null;
+  while (attempt <= MAX_RECONNECTS) {
+    try {
+      collected = await connectOnce({
+        authDir: opts.authDir,
+        targets,
+        windowMinutes,
+        waitSecs,
+        interactive,
+      });
+      break;
+    } catch (failure) {
+      const code = failure && typeof failure.code === "number" ? failure.code : undefined;
+      if (code === DisconnectReason.loggedOut) {
+        writeStdoutJson(
+          errorPayload(
+            "WhatsApp session logged out (401). Delete the auth directory contents and re-run interactively to scan a fresh QR code. Credentials were NOT deleted automatically.",
+            { windowMinutes },
+          ),
+          EXIT_ERROR,
+        );
+        return;
+      }
+      const retryable =
+        code === DisconnectReason.restartRequired ||
+        code === DisconnectReason.connectionLost ||
+        code === DisconnectReason.connectionClosed ||
+        code === DisconnectReason.timedOut;
+      if (retryable && attempt < MAX_RECONNECTS) {
+        const backoff = 2000 * 2 ** attempt;
+        logger.warn({ code, attempt: attempt + 1, backoffMs: backoff }, "connection dropped, retrying");
+        await new Promise((resolve) => {
+          setTimeout(resolve, backoff);
+        });
+        attempt += 1;
+        continue;
+      }
+      const detail = failure && failure.error ? String(failure.error) : `disconnect code ${code}`;
+      writeStdoutJson(
+        errorPayload(`WhatsApp connection failed: ${detail}`, { windowMinutes }),
+        EXIT_ERROR,
+      );
+      return;
+    }
+  }
+  if (!collected) {
+    writeStdoutJson(
+      errorPayload("WhatsApp connection failed after retries.", { windowMinutes }),
+      EXIT_ERROR,
+    );
+    return;
+  }
+
+  const extractedAt = new Date().toISOString();
+  const results = targets.map((target) => {
+    const inWindow = filterByWindow(
+      collected.collected.filter((wam) => wam.key && wam.key.remoteJid === target.jid),
+      collected.cutoffMs,
+    );
+    const context = { contacts: collected.contacts, participants: collected.participants };
+    const messages = inWindow
+      .map((wam) => ({ ts: messageTimestampMs(wam), item: normalizeMessage(wam, context) }))
+      .sort((a, b) => a.ts - b.ts)
+      .map((entry) => entry.item);
+    return buildTargetResult({
+      target,
+      messages,
+      windowMinutes,
+      extractedAt,
+      historySync: collected.historySync,
+    });
+  });
+
+  if (opts.all) {
+    const envelope = buildEnvelope({
+      results,
+      windowMinutes,
+      extractedAt,
+      historySync: collected.historySync,
+    });
+    logger.info(
+      { targets: describeTargets(targets), total: envelope.meta.total_messages },
+      "extraction complete",
+    );
+    writeStdoutJson(envelope, exitCodeForStatus(envelope.status, opts.strict));
+    return;
+  }
+
+  const single = results[0];
+  logger.info(
+    { target: single.meta.target_alias, total: single.meta.total_messages },
+    "extraction complete",
+  );
+  writeStdoutJson(single, exitCodeForStatus(single.status, opts.strict));
+}
+
+const thisFile = fileURLToPath(import.meta.url);
+const invokedAsScript = Boolean(
+  process.argv[1] &&
+    (process.argv[1] === thisFile || process.argv[1].endsWith("/index.js")),
+);
+
+if (invokedAsScript) {
+  main(process.argv).catch((error) => {
+    writeStdoutJson(
+      errorPayload(`Unexpected failure: ${error && error.stack ? error.stack : String(error)}`),
+      EXIT_ERROR,
+    );
+  });
+}

@@ -1,0 +1,9 @@
+#!/usr/bin/env sh
+# Pre-commit: lint (oxlint + anti-slop + read-only guard) and unit tests.
+# Fast by design (~1s): whole-repo oxlint on a single-file CLI needs no
+# lint-staged indirection. Trivy stays in CI + `npm run security` (needs DB).
+if [ ! -d node_modules ]; then
+  echo "pre-commit: node_modules missing — run npm install first." >&2
+  exit 1
+fi
+npm run verify

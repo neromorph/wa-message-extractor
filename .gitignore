@@ -70,6 +70,13 @@ web_modules/
 .env.*
 !.env.example
 
+# wa-message-extractor: infra + deploy details, public repo — never commit
+AGENTS.md
+
+# Baileys auth state — real WhatsApp credentials, never commit
+auth_info/
+auth_info_baileys/
+
 # parcel-bundler cache (https://parceljs.org/)
 .cache
 .parcel-cache
