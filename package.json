@@ -1,6 +1,6 @@
 {
   "name": "wa-message-extractor",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "description": "Secure, production-ready, read-only WhatsApp message extractor CLI",
   "license": "MIT",
   "type": "module",
