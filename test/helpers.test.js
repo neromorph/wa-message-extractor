@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -12,10 +12,13 @@ import {
   extractMessageText,
   filterByWindow,
   formatGroupList,
+  isPaired,
   isRetryable,
   loadTargetsFile,
+  markPaired,
   messageTimestampMs,
   normalizeMessage,
+  quarantineCreds,
   resolveSenderName,
   senderJidOf,
 } from "../index.js";
@@ -301,6 +304,26 @@ describe("isRetryable", () => {
     assert.equal(isRetryable(DisconnectReason.connectionLost), true);
     assert.equal(isRetryable(DisconnectReason.loggedOut), false);
     assert.equal(isRetryable(undefined), false);
+  });
+});
+
+describe("session marker", () => {
+  it("round-trips mark/isPaired in a tmp dir", () => {
+    const dir = mkdtempSync(join(tmpdir(), "wa-session-"));
+    assert.equal(isPaired(dir), false);
+    markPaired(dir);
+    assert.equal(isPaired(dir), true);
+  });
+});
+
+describe("quarantineCreds", () => {
+  it("renames creds.json to a timestamped backup and returns the path", () => {
+    const dir = mkdtempSync(join(tmpdir(), "wa-session-"));
+    writeFileSync(join(dir, "creds.json"), "{}");
+    const backup = quarantineCreds(dir);
+    assert.match(backup, /creds\.json\.bak-/);
+    assert.equal(existsSync(join(dir, "creds.json")), false);
+    assert.equal(existsSync(backup), true);
   });
 });
 

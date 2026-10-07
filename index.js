@@ -27,7 +27,7 @@ import makeWASocket, {
   useMultiFileAuthState,
 } from "@whiskeysockets/baileys";
 import { Command } from "commander";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import pino from "pino";
@@ -433,6 +433,74 @@ function closeSocket(sock) {
   }
 }
 
+export function failureCode(failure) {
+  return failure && typeof failure.code === "number" ? failure.code : undefined;
+}
+
+const PAIRED_MARKER = ".paired-ok";
+const POISONED_CODE = "POISONED";
+
+let quarantineUsed = false;
+
+export function isPaired(authDir) {
+  try {
+    return statSync(join(authDir, PAIRED_MARKER)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+export function markPaired(authDir) {
+  writeFileSync(join(authDir, PAIRED_MARKER), `${new Date().toISOString()}\n`);
+}
+
+export function quarantineCreds(authDir) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const backup = join(authDir, `creds.json.bak-${stamp}`);
+  renameSync(join(authDir, "creds.json"), backup);
+  return backup;
+}
+
+/**
+ * Open one session. Normalizes the poisoned-creds deadlock: a 401 on
+ * creds that never completed a login quarantines once per run, then
+ * continues (fresh QR if interactive, POISONED error if not).
+ * Returns { sock, safe }. Everything else passes through untouched.
+ */
+export async function openSession(input) {
+  const { sock, safe } = await openSocket(input.authDir);
+  try {
+    await waitForOpen(sock, input.interactive);
+  } catch (failure) {
+    closeSocket(sock);
+    const code = failureCode(failure);
+    if (
+      code === DisconnectReason.loggedOut &&
+      !quarantineUsed &&
+      !isPaired(input.authDir) &&
+      existsSync(join(input.authDir, "creds.json"))
+    ) {
+      quarantineUsed = true;
+      const backup = quarantineCreds(input.authDir);
+      logger.warn({ backup }, "quarantined poisoned credentials");
+      if (!input.interactive) {
+        const poisoned = new Error(
+          `Poisoned session quarantined to ${backup}. Re-pair interactively.`,
+        );
+        poisoned.code = POISONED_CODE;
+        poisoned.backup = backup;
+        throw poisoned;
+      }
+      return openSession(input);
+    }
+    throw failure;
+  }
+  if (!isPaired(input.authDir)) {
+    markPaired(input.authDir);
+  }
+  return { sock, safe };
+}
+
 /**
  * Create one Baileys socket wrapped in the read-only Proxy.
  * The raw socket never leaves this module's connection functions.
@@ -455,7 +523,11 @@ async function openSocket(authDir) {
     getMessage: async () => undefined,
   });
   const safe = createReadOnlySocket(sock);
-  sock.ev.on("creds.update", saveCreds);
+  sock.ev.on("creds.update", () => {
+    saveCreds().catch((error) => {
+      logger.fatal({ authDir, error: String(error) }, "failed to save credentials");
+    });
+  });
   return { sock, safe };
 }
 
@@ -493,7 +565,7 @@ function waitForOpen(sock, interactive) {
  * then resolve. Rejects with { fatal, message } on unrecoverable errors.
  */
 async function connectOnce(input) {
-  const { sock, safe } = await openSocket(input.authDir);
+  const { sock, safe } = await openSession(input);
 
   const targetJids = new Set(input.targets.map((target) => target.jid));
   const collected = [];
@@ -556,8 +628,6 @@ async function connectOnce(input) {
     }
   });
 
-  const openPromise = waitForOpen(sock, input.interactive);
-
   // connection.update "close" during the sync window must abort the wait
   let abortSync = null;
   const closeWatcher = (update) => {
@@ -569,13 +639,6 @@ async function connectOnce(input) {
     }
   };
   sock.ev.on("connection.update", closeWatcher);
-
-  try {
-    await openPromise;
-  } catch (failure) {
-    closeSocket(sock);
-    throw failure;
-  }
 
   const cutoffMs = Date.now() - input.windowMinutes * 60 * 1000;
 
@@ -684,13 +747,7 @@ export function formatGroupList(all) {
  * Connect, fetch all participating groups (read query), print, exit.
  */
 async function listGroups(input) {
-  const { sock, safe } = await openSocket(input.authDir);
-  try {
-    await waitForOpen(sock, input.interactive);
-  } catch (failure) {
-    closeSocket(sock);
-    throw failure;
-  }
+  const { sock, safe } = await openSession(input);
   const all = await safe.groupFetchAllParticipating();
   closeSocket(sock);
   return formatGroupList(all);
@@ -703,12 +760,12 @@ async function listGroups(input) {
 async function authOnly(input) {
   let attempt = 0;
   for (;;) {
-    const { sock } = await openSocket(input.authDir);
     try {
-      await waitForOpen(sock, input.interactive);
+      const { sock } = await openSession(input);
+      closeSocket(sock);
       return;
     } catch (failure) {
-      const code = failure && typeof failure.code === "number" ? failure.code : undefined;
+      const code = failureCode(failure);
       if (!isRetryable(code) || attempt >= MAX_RECONNECTS) {
         throw failure;
       }
@@ -718,8 +775,6 @@ async function authOnly(input) {
         setTimeout(resolve, backoff);
       });
       attempt += 1;
-    } finally {
-      closeSocket(sock);
     }
   }
 }
@@ -872,7 +927,11 @@ async function main(argv) {
     try {
       await authOnly({ authDir: opts.authDir, interactive });
     } catch (failure) {
-      const code = failure && typeof failure.code === "number" ? failure.code : undefined;
+      if (failure && failure.code === POISONED_CODE) {
+        writeStdoutJson(errorPayload(String(failure.message), base), EXIT_ERROR);
+        return;
+      }
+      const code = failureCode(failure);
       if (code === DisconnectReason.loggedOut) {
         writeStdoutJson(errorPayload(LOGGED_OUT_MESSAGE, base), EXIT_ERROR);
       } else {
@@ -902,7 +961,11 @@ async function main(argv) {
     try {
       groups = await listGroups({ authDir: opts.authDir, interactive });
     } catch (failure) {
-      const code = failure && typeof failure.code === "number" ? failure.code : undefined;
+      if (failure && failure.code === POISONED_CODE) {
+        writeStdoutJson(errorPayload(String(failure.message), base), EXIT_ERROR);
+        return;
+      }
+      const code = failureCode(failure);
       if (code === DisconnectReason.loggedOut) {
         writeStdoutJson(errorPayload(LOGGED_OUT_MESSAGE, base), EXIT_ERROR);
       } else {
@@ -941,7 +1004,11 @@ async function main(argv) {
       });
       break;
     } catch (failure) {
-      const code = failure && typeof failure.code === "number" ? failure.code : undefined;
+      if (failure && failure.code === POISONED_CODE) {
+        writeStdoutJson(errorPayload(String(failure.message), base), EXIT_ERROR);
+        return;
+      }
+      const code = failureCode(failure);
       if (code === DisconnectReason.loggedOut) {
         writeStdoutJson(
           errorPayload(
