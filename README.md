@@ -171,45 +171,22 @@ pre-seeded with the right ownership (see ADR-002 in the vault).
 
 ## Hermes cron → Telegram topic
 
-Prereqs on the VPS: `mkdir -p ~/.hermes/scripts`, Hermes Telegram
-connected, a forum topic (long-press header → Copy link →
-trailing integer is the thread id).
+Topology: host cron runs the extractor, Hermes only reads. (A gate script
+inside Hermes cannot run containers — the Hermes image ships no Docker
+socket.) Full wiring, as deployed: vault note `Hermes Wiring Wa-Hourly`.
 
-Gate script `~/.hermes/scripts/wa-gate.sh` (flock-guarded — two runs
-must never share the auth volume):
-
-```bash
-#!/usr/bin/env bash
-set -eu
-OUT=/tmp/wa-out.json
-flock -n /tmp/wa-gate.lock \
-  docker compose -f ~/wa-message-extractor/docker-compose.yml run --rm extractor --all --window 60 > "$OUT" 2>/dev/null || exit $?
-TOTAL=$(jq -r '.meta.total_messages // 0' "$OUT")
-STATUS=$(jq -r '.status' "$OUT")
-if [ "$TOTAL" -gt 0 ]; then
-  cp "$OUT" ~/.hermes/cron/output/wa-latest.json
-  printf '{"wakeAgent": true, "context": {"status": "%s", "total_messages": %s, "file": "wa-latest.json"}}\n' "$STATUS" "$TOTAL"
-else
-  printf '{"wakeAgent": false}\n'
-fi
+```cron
+# host crontab — extractor hourly, exit code captured for the gate
+5 * * * * flock -n /tmp/wa-extract.lock sh -c 'cd /home/mufid/wa-message-extractor && docker compose run --rm extractor --all --window 60 --topic Merkle > out/latest.json 2> out/last-stderr.log; echo $? > out/last-exit'
 ```
 
-Schedule an **LLM-driven** job with the gate attached (empty hours cost $0,
-busy hours get a real summary in the topic):
-
-```bash
-hermes cron create "0 * * * *" \
-  "Read ~/.hermes/cron/output/wa-latest.json and post a concise summary \
-   of the new WhatsApp messages to the topic, flagging anything that needs action." \
-  --script wa-gate.sh \
-  --deliver telegram:<chat_id>:<thread_id> \
-  --name wa-hourly
-```
-
-`--deliver telegram:<chat_id>:<thread_id>` addresses the topic
-directly; alternatively set `TELEGRAM_CRON_THREAD_ID=<thread_id>` in the
-Hermes `.env`. To silence the root chat entirely, enable Telegram topic mode
-per the Hermes docs.
+- Share one read-only bind with Hermes:
+  `/home/mufid/wa-message-extractor/out:/opt/data/wa-out:ro`.
+- Gate `wa-gate.py` (in Hermes `$HERMES_HOME/scripts`): exit `1`/`2` →
+  alert with 6h cooldown, `0` + zero messages → silent, `0` + messages →
+  wake with counts. Job: LLM-driven, `--continuity`, failures to a
+  separate DM via `--failure-deliver`.
+- `targets.json` is the group registry — re-read every run, no restart.
 
 ## Quality gates
 
