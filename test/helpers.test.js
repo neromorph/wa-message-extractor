@@ -11,6 +11,7 @@ import {
   extractMessageText,
   filterByWindow,
   formatGroupList,
+  isRetryable,
   loadTargetsFile,
   messageTimestampMs,
   normalizeMessage,
@@ -290,6 +291,16 @@ describe("buildEnvelope", () => {
     assert.equal(envelope.meta.target_count, 2);
     assert.equal(envelope.meta.total_messages, 1);
     assert.equal(envelope.results.length, 2);
+  });
+});
+
+describe("isRetryable", () => {
+  it("retries transient closes but not logout", async () => {
+    const { DisconnectReason } = await import("@whiskeysockets/baileys");
+    assert.equal(isRetryable(DisconnectReason.restartRequired), true);
+    assert.equal(isRetryable(DisconnectReason.connectionLost), true);
+    assert.equal(isRetryable(DisconnectReason.loggedOut), false);
+    assert.equal(isRetryable(undefined), false);
   });
 });
 

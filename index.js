@@ -412,6 +412,15 @@ function disconnectCode(error) {
   return undefined;
 }
 
+export function isRetryable(code) {
+  return (
+    code === DisconnectReason.restartRequired ||
+    code === DisconnectReason.connectionLost ||
+    code === DisconnectReason.connectionClosed ||
+    code === DisconnectReason.timedOut
+  );
+}
+
 function closeSocket(sock) {
   // sock.end exists in the pinned Baileys; failures mean already closing.
   try {
@@ -689,17 +698,32 @@ async function listGroups(input) {
 
 /**
  * Authenticate only: connect (QR on first run), save creds, close, exit.
- * No history sync, no queries.
+ * No history sync, no queries. Retries the post-pairing restart (515).
  */
 async function authOnly(input) {
-  const { sock } = await openSocket(input.authDir);
-  try {
-    await waitForOpen(sock, input.interactive);
-  } catch (failure) {
-    closeSocket(sock);
-    throw failure;
+  const maxAttempts = input.maxAttempts || MAX_RECONNECTS + 1;
+  let attempt = 0;
+  for (;;) {
+    const { sock } = await openSocket(input.authDir);
+    try {
+      await waitForOpen(sock, input.interactive);
+      closeSocket(sock);
+      return;
+    } catch (failure) {
+      closeSocket(sock);
+      const code = failure && typeof failure.code === "number" ? failure.code : undefined;
+      if (isRetryable(code) && attempt + 1 < maxAttempts) {
+        const backoff = 2000 * 2 ** attempt;
+        logger.warn({ code, attempt: attempt + 1, backoffMs: backoff }, "auth retrying");
+        await new Promise((resolve) => {
+          setTimeout(resolve, backoff);
+        });
+        attempt += 1;
+        continue;
+      }
+      throw failure;
+    }
   }
-  closeSocket(sock);
 }
 
 const LOGGED_OUT_MESSAGE =
@@ -930,11 +954,7 @@ async function main(argv) {
         );
         return;
       }
-      const retryable =
-        code === DisconnectReason.restartRequired ||
-        code === DisconnectReason.connectionLost ||
-        code === DisconnectReason.connectionClosed ||
-        code === DisconnectReason.timedOut;
+      const retryable = isRetryable(code);
       if (retryable && attempt < MAX_RECONNECTS) {
         const backoff = 2000 * 2 ** attempt;
         logger.warn({ code, attempt: attempt + 1, backoffMs: backoff }, "connection dropped, retrying");
