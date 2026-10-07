@@ -48,6 +48,7 @@ jobs:
           skip-dirs: .git,auth_info
           skip-files: targets.json
           exit-code: "1"
+          limit-severities-for-sarif: true
           format: sarif
           output: trivy-fs.sarif
       - name: Upload fs SARIF
@@ -100,6 +101,7 @@ jobs:
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: "1"
+          limit-severities-for-sarif: true
           format: sarif
           output: trivy-image.sarif
       - name: Upload image SARIF
