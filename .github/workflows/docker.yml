@@ -32,7 +32,9 @@ jobs:
             and (.services.extractor.security_opt | index("no-new-privileges:true"))
             and .services.extractor.user == "65532:65532"
             and (.services.extractor.tmpfs | length > 0)
-            and ([.services.extractor.volumes[] | select(contains("targets.json")) | contains(":ro")] | any)
+            and ([.services.extractor.volumes[]
+                  | select(.target == "/app/targets.json")
+                  | .read_only == true] | any)
           ' >/dev/null
       - name: Trivy fs scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
