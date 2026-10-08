@@ -129,3 +129,30 @@ jobs:
         with:
           name: sbom-${{ github.ref_name }}
           path: sbom.cdx.json
+
+  deploy:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: none
+    steps:
+      - name: Join tailnet
+        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci-deploy
+      - name: Deploy release to VPS
+        env:
+          VPS_SSH_HOST: ${{ secrets.VPS_SSH_HOST }}
+          VPS_SSH_USER: ${{ secrets.VPS_SSH_USER }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          VER="${GITHUB_REF#refs/tags/v}"
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$VPS_SSH_HOST" >> ~/.ssh/known_hosts
+          ssh -i ~/.ssh/deploy_key "${VPS_SSH_USER}@${VPS_SSH_HOST}" \
+            "cd ~/wa-message-extractor && sed -i 's|image: neromorph/wa-message-extractor:[^ ]*|image: neromorph/wa-message-extractor:${VER}|' compose.yaml && grep 'image:' compose.yaml && docker compose pull && docker compose up -d"

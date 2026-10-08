@@ -224,13 +224,13 @@ docker compose config --format json | jq -e '.services.extractor.read_only == tr
 ## Releases & deploy
 
 - Push to `main` → build, scan, push `:edge` + `:sha-xxxxxxx` (no deploy).
-- Tag `v*` → push `:X.Y.Z`, `:X.Y`, `:latest`. No auto-deploy: pull manually.
-- Deploy (manual, on the VPS):
-  ```bash
-  cd ~/wa-message-extractor
-  git pull --ff-only
-  docker compose pull
-  ```
+- Tag `v*` → push `:X.Y.Z`, `:X.Y`, `:latest`, then auto-deploy: CI joins
+  the tailnet, SSHes to the VPS, pins the released tag in
+  `~/wa-message-extractor/compose.yaml` (VPS-local, not in git),
+  `docker compose pull && docker compose up -d`.
+- Deploy needs 5 extra secrets: `TS_OAUTH_CLIENT_ID` + `TS_OAUTH_SECRET`
+  (OAuth client with devices-write for `tag:ci-deploy`), `VPS_SSH_HOST`,
+  `VPS_SSH_USER`, `VPS_SSH_KEY`.
 - Rollback: re-tag an older `:sha-xxxxxxx`, or `git checkout vX` + `compose pull`.
 - Secrets: `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`. Third-party actions are SHA-pinned.
 
