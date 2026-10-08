@@ -143,6 +143,7 @@ jobs:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci-deploy
+          ping: ${{ secrets.VPS_SSH_HOST }}
       - name: Deploy release to VPS
         env:
           VPS_SSH_HOST: ${{ secrets.VPS_SSH_HOST }}
