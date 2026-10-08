@@ -620,6 +620,8 @@ async function connectOnce(input) {
   let explicitComplete = false;
   let notifyChunk = () => {};
   let notifyStatus = () => {};
+  let notifyUpsert = () => {};
+  let upserts = 0;
 
   const isWanted = (wam) => {
     const remote = wam.key ? wam.key.remoteJid : undefined;
@@ -653,6 +655,8 @@ async function connectOnce(input) {
       for (const wam of messages) {
         if (isWanted(wam)) {
           collected.push(wam);
+          upserts += 1;
+          notifyUpsert();
         }
       }
     }
@@ -749,8 +753,9 @@ async function connectOnce(input) {
     };
     notifyChunk = armQuiet;
     notifyStatus = armQuiet;
+    notifyUpsert = armQuiet;
     // Seed the quiet timer in case history already arrived before open.
-    if (chunks > 0) {
+    if (chunks > 0 || upserts > 0) {
       armQuiet();
     }
   });

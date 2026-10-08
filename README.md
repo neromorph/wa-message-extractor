@@ -151,7 +151,9 @@ Sender names resolve `pushName` → saved contact → group participant → JID.
 
 `total_messages: 0` means "nothing in the window **that WhatsApp synced**",
 not provable silence — check `history_sync` (`stopped_by: "cap"` degrades
-the result to `PARTIAL`).
+the result to `PARTIAL`). Live RECENT-sync messages also arm the settle
+timer, so upsert-fed runs finish `silence` → `OK`; only a fully quiet
+window (no history, no live messages) still caps to `PARTIAL`.
 
 ## Docker
 
